@@ -12,9 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SWE Agent configuration utilities."""
-
-from .config_builder import SWEAgentConfigBuilder
-from .config_validator import AgentConfigValidator, ConfigValidationError
-
-__all__ = ["SWEAgentConfigBuilder", "AgentConfigValidator", "ConfigValidationError"]
+"""SWE Agent tests."""

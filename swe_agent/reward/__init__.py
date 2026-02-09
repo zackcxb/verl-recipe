@@ -13,14 +13,18 @@
 # limitations under the License.
 """SWE Agent Reward Functions."""
 
-from .reward import (
+from .swe_reward import (
     compare_patches_simple,
-    compute_score,
+    compute_batch_rewards,
+    compute_swe_agent_reward,
+    extract_changed_files,
     normalize_patch,
 )
 
 __all__ = [
-    "compute_score",
+    "compute_swe_agent_reward",
+    "compute_batch_rewards",
     "compare_patches_simple",
     "normalize_patch",
+    "extract_changed_files",
 ]

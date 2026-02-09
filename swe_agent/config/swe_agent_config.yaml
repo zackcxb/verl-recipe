@@ -16,61 +16,43 @@
 # SWE Agent Loop Configuration for VERL
 # =============================================================================
 # Reference: SWE-agent/config/default.yaml official config
-# Optimized for small models (Qwen3-4B):
+# Optimized for small models (Qwen2.5-3B):
 #   - system_template specifies thought_action format (single code block only)
 #   - instance_template emphasizes submitting patch via submit command
 #   - max_requeries=5 gives small models more retry opportunities
-#
-# --- Field Override Mechanism ---
-# Fields are divided into two categories:
-#
-# 1. Infrastructure fields: Fixed per deployment, shared across all tasks.
-#    Defined ONLY in this YAML.
-#
-# 2. Data-affine fields (marked with "# [DATA-AFFINE]"):
-#    May vary per task/dataset. Values here serve as DEFAULTS.
-#    At runtime, per-instance overrides from extra_info take priority:
-#      extra_info > YAML defaults
-#    Data-affine fields can be set during data preparation (prepare_data.py)
-#    in the extra_info.sandbox_overrides / extra_info.agent_overrides dicts.
 # =============================================================================
 
 - name: swe_agent
   _target_: recipe.swe_agent.swe_agent_loop.SWEAgentLoop
 
   # ModelProxy config - intercepts SWE-Agent API requests
-  # [INFRASTRUCTURE]
   proxy_config:
-    port: 0                 # 0 => let OS assign an available port (recommended for multi-worker)
-    max_port_retries: 1000  # Used when port > 0: max consecutive ports to try (increase for 500+ workers per node)
+    port: 8080              # ModelProxy listening port (auto-increments to avoid conflicts)
+    max_port_retries: 1000  # Max consecutive ports to try (increase for 500+ workers per node)
     timeout: 600            # Per-request timeout (seconds)
 
   # SWE-Agent execution config
   sandbox_config:
-    # --- Infrastructure fields (fixed per deployment) ---
     swe_agent_timeout: 1800 # SWE-Agent total execution time limit (seconds)
+    max_steps: 30           # Max model call count (simple tasks need 5~10 steps)
     execution_timeout: 300  # Per-tool execution timeout (seconds)
     output_dir: ./swe_agent_outputs    # Output directory (relative to cwd; override as needed)
+    python_path: python3              # Python binary (set full path if not on PATH)
+    # Max interaction turns, aborts current task when reached
+    max_turns: 15
+    # deployment_type: "docker" uses Docker isolation (default, recommended for production)
+    # deployment_type: "local" skips Docker containers (faster startup, for debugging only)
+    deployment_type: docker
+    # Docker config (only effective when deployment_type=docker)
+    docker_image: swerex-python:3.11
     docker_memory_limit: 8g
     docker_startup_timeout: 180.0
     docker_remove_container: true
 
-    # --- Data-affine fields (can be overridden per instance via extra_info.sandbox_overrides) ---
-    # [DATA-AFFINE] Max model call count (simple tasks: 5~10, complex tasks: 30+)
-    max_steps: 30
-    # [DATA-AFFINE] Max interaction turns (global loop cap; includes normal steps + requery retries)
-    max_turns: 15
-    # [DATA-AFFINE] Docker image - different repos need different Python versions/dependencies
-    # SWE-bench instances map to specific images; override via extra_info.sandbox_overrides.docker_image
-    docker_image: swerex-python:3.11
-
   # Agent config - optimized for small models
   agent:
-    # Retries per step after format/blocklist/bash-syntax errors; each retry still consumes max_turns budget
+    # Retries after format errors (default 3, small models need more retries)
     max_requeries: 5
-
-    # --- Data-affine templates (can be overridden per instance via extra_info.agent_overrides.templates) ---
-    # [DATA-AFFINE] Templates vary by task type (SWE-bench vs custom tasks vs different prompt styles)
     templates:
       system_template: |-
         You are a helpful assistant that can interact with a computer to solve tasks.
@@ -115,8 +97,6 @@
         {{observation}}
       next_step_no_output_template: |-
         Your command ran successfully and did not produce any output.
-
-    # --- Data-affine tools config (can be overridden per instance via extra_info.agent_overrides.tools) ---
     tools:
       env_variables:
         PAGER: cat
@@ -125,7 +105,6 @@
         PIP_PROGRESS_BAR: 'off'
         TQDM_DISABLE: '1'
         GIT_PAGER: cat
-      # [DATA-AFFINE] Tool bundles may vary by task type
       bundles:
         - path: tools/registry
         - path: tools/edit_anthropic
@@ -133,7 +112,8 @@
       registry_variables:
         USE_FILEMAP: 'true'
       enable_bash_tool: true
-      # [DATA-AFFINE] Parse function type: thought_action for text-gen models, function_calling for OpenAI-compatible
+      # Use thought_action mode - suitable for text generation models
+      # function_calling requires OpenAI API tool_calls field, which Qwen models don't support
       parse_function:
         type: thought_action
     history_processors:

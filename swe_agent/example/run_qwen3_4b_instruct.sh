@@ -51,7 +51,7 @@ test_files=$DATA_DIR/test.parquet
 
 if [ ! -f "$train_files" ]; then
     echo "[ERROR] Test data not found at $train_files"
-    echo "Run: python3 recipe/swe_agent/prepare/prepare_data.py --mode simple --train_size 8 --test_size 2 --output_dir data/swe_agent_test"
+    echo "Run: python3.12 recipe/swe_agent/prepare/prepare_data.py --mode simple --train_size 8 --test_size 2 --output_dir data/swe_agent_test"
     exit 1
 fi
 
@@ -79,8 +79,8 @@ max_prompt_length=4096    # Actual prompt ~300 tokens, but padding upper bound n
 max_response_length=16384 # Multi-turn dialogue accumulates long responses (incl. retries), 16k reduces truncation
 actor_lr=5e-6             # GRPO typically needs higher LR than PPO to learn signal
 
-train_batch_size=${TRAIN_BATCH_SIZE:-8}   # Should match agent_loop_workers count
-ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-4}  # mini_batch < batch: multiple gradient updates per step
+train_batch_size=8        # Should match agent_loop_workers count
+ppo_mini_batch_size=4     # mini_batch < batch: multiple gradient updates per step for better data utilization
 n_resp_per_prompt=1
 n_resp_per_prompt_val=1
 
@@ -134,7 +134,40 @@ echo "  Batch size: $train_batch_size"
 echo "  TP: $infer_tp, SP: $train_sp"
 echo "=========================================="
 
-python3 -m verl.trainer.main_ppo \
+# ================= Pre-install SWE-Agent tools (for local mode only) =================
+# NOTE: In Docker mode (default), tools are installed inside containers, so this step
+# only helps when running in local deployment mode to prevent FileExistsError.
+# In Docker mode with --network host, this step can be safely skipped.
+SWE_AGENT_TOOLS_SRC="$VERL_ROOT/../SWE-agent/tools"
+SWE_AGENT_TOOLS_DST="/root/tools"
+
+echo "Checking SWE-Agent tools pre-installation (for local mode)..."
+if [ -d "$SWE_AGENT_TOOLS_SRC" ]; then
+    # Create destination directory if it doesn't exist
+    if ! mkdir -p "$SWE_AGENT_TOOLS_DST" 2>/dev/null; then
+        echo "⚠ Warning: Cannot create $SWE_AGENT_TOOLS_DST (permission denied?)"
+        echo "  This is fine if using Docker mode (default)."
+    else
+        # Clean existing tools to avoid conflicts
+        if [ -d "$SWE_AGENT_TOOLS_DST" ] && [ "$(ls -A "$SWE_AGENT_TOOLS_DST" 2>/dev/null)" ]; then
+            rm -rf "$SWE_AGENT_TOOLS_DST"/* 2>/dev/null || true
+        fi
+        
+        # Copy tools
+        if cp -r "$SWE_AGENT_TOOLS_SRC"/* "$SWE_AGENT_TOOLS_DST"/ 2>/dev/null; then
+            echo "✓ SWE-Agent tools pre-installed to $SWE_AGENT_TOOLS_DST"
+        else
+            echo "⚠ Warning: Failed to copy SWE-Agent tools."
+            echo "  This is fine if using Docker mode (default)."
+        fi
+    fi
+else
+    echo "⚠ SWE-Agent tools source not found at $SWE_AGENT_TOOLS_SRC"
+    echo "  This is fine if using Docker mode (tools will be installed in containers)."
+fi
+echo ""
+
+python3.12 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=$adv_estimator \
     algorithm.use_kl_in_reward=$use_kl_in_reward \
     algorithm.kl_ctrl.kl_coef=$kl_coef \
@@ -181,7 +214,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.6 \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
-    custom_reward_function.path="${RECIPE_DIR}/reward/reward.py" \
+    custom_reward_function.path="${RECIPE_DIR}/reward/compute_score.py" \
     custom_reward_function.name=compute_score \
     trainer.logger='["console"]' \
     trainer.project_name=$project_name \
