@@ -1,319 +1,207 @@
-# SWE-Agent VERL Recipe
+# SWE Agent Recipe for VERL
 
-Train language models to solve real-world software engineering tasks using reinforcement learning. This recipe integrates [SWE-agent](https://github.com/SWE-agent/SWE-agent) as the agent framework with VERL's PPO/GRPO trainer, enabling models to learn from interactive coding feedback in Docker-sandboxed environments.
+A reinforcement learning recipe for training software engineering agents using the VERL framework.
 
 ## Overview
 
-The training loop works as follows:
+This recipe enables training LLMs to solve software engineering tasks through:
+- Code analysis and modification
+- Bug fixing
+- Feature implementation
+- Test-driven development
 
-1. **Data**: Each training sample contains a problem statement (e.g. "fix the bug in calculator.py") and a reference patch.
-2. **Rollout**: For each sample, a SWE-Agent subprocess is launched inside a Docker container. The agent interacts with a codebase by reading files, editing code, and running commands.
-3. **Model Proxy**: A lightweight HTTP server intercepts the agent's LLM API calls and routes them through VERL's vLLM rollout engine, so every token the agent generates is on-policy.
-4. **Reward**: After the agent finishes (or hits the turn limit), its generated patch is compared against the reference patch to produce a 0–1 reward signal.
-5. **Training**: VERL applies GRPO (or PPO) policy gradient updates using the collected trajectories and rewards.
+The agent operates in a sandboxed environment (Docker or local) with access to:
+- File operations (read, write, edit)
+- Shell commands
+- Git operations
+- Test execution
 
-```
-┌─────────────────────────────────────────────────────┐
-│               VERL PPO/GRPO Trainer                 │
-│  (actor, ref model, vLLM rollout, reward scoring)   │
-└──────────────────────┬──────────────────────────────┘
-                       │  per-episode
-          ┌────────────┴────────────┐
-          │   SWEAgentLoop.run()    │
-          └────────────┬────────────┘
-                       │
-     ┌─────────────────┼─────────────────┐
-     │                 │                 │
-     ▼                 ▼                 ▼
-┌──────────┐   ┌─────────────┐   ┌──────────────┐
-│ TempRepo │   │ ModelProxy  │   │ sweagent run  │
-│ (git)    │   │ (HTTP)      │◄──│ (subprocess)  │
-└──────────┘   └──────┬──────┘   └──────────────┘
-                      │
-                      ▼
-              ┌───────────────┐
-              │ vLLM generate │
-              │ (on-policy)   │
-              └───────┬───────┘
-                      │
-                      ▼
-              ┌───────────────┐
-              │ compute_score │
-              │ (patch diff)  │
-              └───────────────┘
-```
+## Features
 
-## Directory Structure
-
-```
-recipe/swe_agent/
-├── swe_agent_loop.py              # Core agent loop (registered as "swe_agent")
-├── config/
-│   ├── swe_agent_config.yaml      # Agent config (templates, tools, sandbox settings)
-│   ├── runtime_config.py          # Runtime config dataclass + merge logic
-│   ├── yaml_builder.py            # Generates per-instance SWE-Agent CLI YAML
-│   ├── defaults.py                # Shared default templates/tool settings
-│   └── __init__.py                # Config exports
-├── runtime/
-│   ├── model_proxy.py             # HTTP proxy: SWE-Agent ↔ vLLM
-│   ├── subprocess_runner.py       # Runs `sweagent run` as subprocess
-│   └── container_cleanup.py       # Docker container cleanup
-├── reward/
-│   └── reward.py                  # Patch-based reward function
-├── prepare/
-│   └── prepare_data.py            # Dataset generator (simple tasks / SWE-bench)
-├── utils/
-│   ├── message_utils.py           # OpenAI message normalization
-│   ├── repo_manager.py            # Temp git repo creation/cleanup
-│   └── patch_extractor.py         # Extract patches from .patch files or git diff
-├── example/
-    └── run_qwen3_4b_instruct.sh   # Single-node 8-GPU training script
-```
-
-## Prerequisites
-
-### Hardware
-
-- 8x NVIDIA GPUs (tested on RTX 3090 24GB, A100 also works)
-- Sufficient disk space for model checkpoints (~50GB per checkpoint)
-
-### Runtime Environment (Docker-in-Docker)
-
-This recipe is designed to run inside a VERL Docker container. Since the training loop spawns SWE-Agent sandbox containers via Docker, the host container must be launched with **Docker-in-Docker (DinD)** support and **host networking**.
-
-Key `docker run` flags:
-
-| Flag | Why |
-|------|-----|
-| `--network host` | Required so that the ModelProxy HTTP server (inside the container) is reachable by SWE-Agent sandbox containers on the same host. Without this, sandbox containers cannot call back to the proxy. |
-| `-v /var/run/docker.sock:/var/run/docker.sock` | Mounts the host Docker socket, allowing the training process to create/manage SWE-Agent sandbox containers from inside the VERL container. |
-| `-v /usr/bin/docker:/usr/bin/docker:ro` | Makes the Docker CLI binary available inside the container. |
-
-Example launch command:
-
-```bash
-# Build or pull the VERL training image first, then run:
-docker run -it \
-  --gpus all \
-  --network host \
-  --shm-size=32g \
-  -v /var/run/docker.sock:/var/run/docker.sock \
-  -v /usr/bin/docker:/usr/bin/docker:ro \
-  -v /path/to/data:/data \
-  -v /path/to/models:/models \
-  --entrypoint /bin/bash \
-  --name verl_swe_train \
-  <your-verl-image>
-```
-
-> **Note**: You may also need to mount NVIDIA driver libraries (e.g. `libnvidia-ml.so.1`, `libcuda.so.1`) if the base image does not include them. Use `--gpus all` (requires [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)) or mount individual `.so` files as read-only volumes.
-
-After entering the container, verify Docker access:
-
-```bash
-docker ps          # should list running containers on the host
-docker pull swerex-python:3.11   # pre-pull the sandbox image
-```
-
-### Software
-
-```bash
-# 1. VERL framework (already installed in this repo)
-# 2. SWE-agent CLI
-pip install sweagent
-which sweagent  # verify
-
-# 3. Docker + swerex image (for sandboxed code execution)
-docker pull swerex-python:3.11
-docker images swerex-python:3.11  # verify
-
-# 4. Model weights (Qwen3-4B-Instruct or your choice)
-ls /path/to/models/Qwen/Qwen3-4B-Instruct-2507/config.json
-```
-
-### Verify Environment
-
-```bash
-nvidia-smi -L | wc -l                                        # expect: 8
-python3 -c "import socket; print(socket.gethostbyname(socket.gethostname()))"
-#   ^ Must print real IP, NOT 127.0.x.x
-docker images swerex-python:3.11 --format '{{.Repository}}'  # swerex-python
-```
+- **Multiple Dataset Support**: Simple test cases, SWE-bench Lite, and SWE-bench_Verified
+- **Docker Integration**: Isolated execution environments per task
+- **Flexible Reward System**: Patch-based evaluation with extensible scoring
+- **Data-Affine Overrides**: Per-instance configuration for Docker images, timeouts, templates
+- **Comprehensive Testing**: Unit, integration, and end-to-end tests
 
 ## Quick Start
 
-### 1. Generate Training Data
+### 1. Generate Simple Test Data
 
 ```bash
-cd /path/to/agentic-rl/verl
-
-# Simple synthetic tasks (good for testing the pipeline)
-python recipe/swe_agent/prepare/prepare_data.py \
-    --mode simple \
-    --train_size 8 \
-    --test_size 2 \
-    --output_dir data/swe_agent_test
-
-# Or load SWE-bench Lite for real-world tasks
-python recipe/swe_agent/prepare/prepare_data.py \
-    --mode swebench \
-    --swebench_train /path/to/swebench_train.jsonl \
-    --swebench_test /path/to/swebench_test.jsonl \
-    --output_dir data/swe_agent_swebench
+python -m swe_agent.prepare.prepare_data \
+  --mode simple \
+  --train_size 100 \
+  --test_size 10 \
+  --output_dir data/swe_agent
 ```
 
-The generated parquet files contain:
-- `prompt`: Minimal chat-formatted problem description
-- `reward_model.ground_truth`: Expected patch for reward computation
-- `extra_info`: Problem statement, repo content, per-instance overrides
-
-### 2. Launch Training (Single Node, 8 GPU)
+### 2. Train
 
 ```bash
-cd /path/to/agentic-rl/verl
+# Configure your training script with:
+# - Data path: data/swe_agent/train.parquet
+# - Reward function: recipe/swe_agent/reward/reward.py:compute_score
 
-# Clean old checkpoints if doing a fresh run (important!)
-rm -rf /path/to/workspace/checkpoints/qwen3-4b-swe-train-v1/
-
-# Launch training
-bash recipe/swe_agent/example/run_qwen3_4b_instruct.sh
+python -m verl.trainer.main_ppo \
+  --config your_config.yaml
 ```
 
-### 3. Monitor Progress
+## SWE-bench_Verified Integration
+
+### Overview
+
+The SWE Agent recipe now supports training with [SWE-bench_Verified](https://www.swebench.com/), a curated dataset of 500 real-world software engineering tasks from 12 popular Python repositories.
+
+### Quick Start
+
+#### 1. Check Docker Images
 
 ```bash
-# Training phases and expected timeline (~18 min for 2 epochs, 8 samples)
-#   Ray + Model Init   ~2 min    "Loading checkpoint shards"
-#   vLLM Init           ~1 min    "Capturing CUDA graphs"
-#   Weights Sync        ~12s      "update_weights done"
-#   Rollout (per epoch) ~2-5 min  "SWE Agent Loop completed"
-#   Training Step       ~45s      "actor/pg_loss"
-#   Checkpoint Save     ~2.5 min  "Saved model to"
-
-# Ray dashboard
-# http://<HEAD_IP>:8265
+python -m swe_agent.scripts.check_docker_images \
+  /data1/dataset/SWE-bench_Verified/data/test-00000-of-00001.parquet
 ```
 
-## Configuration
+#### 2. Prepare Dataset
 
-### Training Script Parameters
+```bash
+# Using helper script
+./recipe/swe_agent/scripts/prepare_swebench_verified.sh
 
-Key parameters in `example/run_qwen3_4b_instruct.sh`:
+# Or manually
+python -m swe_agent.prepare.prepare_data \
+  --mode swebench_verified \
+  --swebench_verified_train /data1/dataset/SWE-bench_Verified/data/test-00000-of-00001.parquet \
+  --swebench_verified_test /data1/dataset/SWE-bench_Verified/data/test-00000-of-00001.parquet \
+  --skip_missing_images \
+  --output_dir data/swe_agent_verified
+```
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `NNODES` | 1 | Number of nodes |
-| `GPUS_PER_NODE` | 8 | GPUs per node |
-| `train_batch_size` | 8 | Training batch size |
-| `ppo_mini_batch_size` | 4 | Mini-batch size for PPO/GRPO updates |
-| `max_turns` | 15 | Max agent interaction turns |
-| `max_prompt_length` | 4096 | Max prompt token length |
-| `max_response_length` | 16384 | Max response token length (multi-turn accumulates) |
-| `infer_tp` | 8 | vLLM tensor parallel size |
-| `train_sp` | 8 | Ulysses sequence parallel size |
-| `gpu_memory_utilization` | 0.4 | vLLM GPU memory fraction |
-| `total_epochs` | 2 | Number of training epochs |
+#### 3. Train
 
-### Agent Config (`config/swe_agent_config.yaml`)
+```bash
+# See example configuration in:
+# recipe/swe_agent/example/run_swebench_verified.sh
 
-The YAML config is the default source of truth and has two categories of fields:
+# Adapt to your setup:
+export MODEL_PATH=/path/to/your/model
+export SWEBENCH_VERIFIED_DATA=/data1/dataset/SWE-bench_Verified/data/test-00000-of-00001.parquet
+./recipe/swe_agent/example/run_swebench_verified.sh
+```
 
-**Infrastructure fields** (fixed per deployment):
-- `proxy_config`: ModelProxy port, timeout, retry settings
-- `sandbox_config.docker_memory_limit`: Container memory limit
+### Features
 
-**Data-affine fields** (can be overridden per instance via `extra_info`):
-- `sandbox_config.max_turns`: Max interaction turns
-- `sandbox_config.max_steps`: Max model call count
-- `sandbox_config.docker_image`: Sandbox Docker image
-- `agent.templates`: System/instance/next-step prompt templates
-- `agent.tools`: Tool bundles, parse function type
+- **Docker Integration**: Each instance runs in its own Docker container with pre-configured environment
+- **Image Filtering**: Automatically skip instances with missing Docker images
+- **Standard Evaluation**: Compatible with SWE-bench evaluation harness
+- **Flexible Reward**: Currently uses patch similarity; extensible to test execution
 
-Per-instance overrides are applied at runtime via `extra_info.sandbox_overrides` and `extra_info.agent_overrides`.
+### Dataset Statistics
 
-## Key Components
+- Total instances: 500
+- Repositories: 12 (django, sympy, matplotlib, scikit-learn, etc.)
+- Pre-built images: ~264 (varies by setup)
+- Docker image format: `sweb.eval.x86_64.{instance_id}:latest`
 
-### SWEAgentLoop (`swe_agent_loop.py`)
+### Documentation
 
-The core agent loop, registered with VERL as `"swe_agent"`. For each episode:
+- [Integration Guide](docs/swe_bench_verified_integration.md) - Detailed setup and usage
+- [Training Configuration](example/README_swebench_verified.md) - Configuration options
+- [Architecture Details](docs/swe_bench_verified_integration.md#architecture-details)
 
-1. Parses `extra_info` to get the problem statement and repo content
-2. Creates a temporary git repo on disk
-3. Starts a `ModelProxy` HTTP server
-4. Launches `sweagent run` as a subprocess pointing at the proxy
-5. Runs the interaction loop: each agent API call is intercepted, tokenized, sent to vLLM for generation, and the response is returned to the agent
-6. Extracts the final patch and returns it as `AgentLoopOutput`
+## Module Structure
 
-### ModelProxy (`runtime/model_proxy.py`)
+```
+recipe/swe_agent/
+├── prepare/
+│   ├── prepare_data.py          # CLI for data preparation
+│   └── load_swebench.py          # SWE-bench loaders (Lite + Verified)
+├── reward/
+│   └── reward.py                 # Reward function with patch comparison
+├── utils/
+│   ├── docker_utils.py           # Docker image utilities
+│   ├── patch_extractor.py        # Patch extraction from agent output
+│   └── repo_manager.py           # Repository management
+├── config/
+│   ├── yaml_builder.py           # SWE-Agent YAML configuration
+│   ├── runtime_config.py         # Runtime config with data overrides
+│   └── swe_agent_config.yaml    # Default agent configuration
+├── scripts/
+│   ├── check_docker_images.py   # Docker image availability checker
+│   └── prepare_swebench_verified.sh  # Data preparation helper
+├── example/
+│   ├── run_swebench_verified.sh # Example training script
+│   └── README_swebench_verified.md  # Configuration guide
+├── docs/
+│   └── swe_bench_verified_integration.md  # Integration guide
+├── tests/
+│   ├── test_docker_utils.py     # Docker utilities tests
+│   ├── test_prepare_data.py     # Data preprocessing tests
+│   ├── test_reward_swebench.py  # Reward function tests
+│   ├── test_yaml_builder_docker.py  # YAML builder tests
+│   └── test_integration_swebench.py  # Integration tests
+└── swe_agent_loop.py             # Main agent loop
 
-A lightweight HTTP server that mimics the OpenAI Chat Completions API. SWE-Agent sends requests to this proxy thinking it's an LLM API. The proxy:
-- Queues requests for VERL to consume
-- Blocks until VERL's vLLM engine generates a response
-- Returns the response to SWE-Agent
+```
 
-Default `proxy_config.port=0` lets the OS assign an available port for each worker (recommended).
-If you set a fixed port (`port > 0`), ModelProxy falls back to auto-increment (`port+1`, `port+2`, ...)
-when conflicts occur.
+## Data Format
 
-### Reward Function (`reward/reward.py`)
+All datasets are converted to VERL-compatible format:
 
-Computes a 0–1 reward by comparing the agent's generated patch against the expected patch:
+```python
+{
+    "prompt": [{"role": "user", "content": "Problem description"}],
+    "data_source": "swe_bench_verified",  # or "swe_agent_simple", "swe_bench_lite"
+    "ability": "software_engineering",
+    "reward_model": {
+        "style": "swe_bench",
+        "instance_id": "django__django-12345",
+        "gold_patch": "diff --git ...",
+        "test_patch": "diff --git ...",
+        "FAIL_TO_PASS": ["test1", "test2"],
+        "PASS_TO_PASS": ["test3"]
+    },
+    "extra_info": {
+        "instance_id": "django__django-12345",
+        "problem_statement": "Fix bug in admin...",
+        "docker_image": "sweb.eval.x86_64.django__django-12345:latest",
+        "sandbox_overrides": {
+            "docker_image": "sweb.eval.x86_64.django__django-12345:latest"
+        },
+        ...
+    },
+    "agent_name": "swe_agent"
+}
+```
 
-| Condition | Score |
-|-----------|-------|
-| Exact patch match | 1.0 |
-| All changed files match | 0.5 |
-| Partial file overlap | 0.2 + 0.3 × overlap_ratio |
-| Patch generated but no overlap | 0.1 |
-| No patch generated | 0.0 |
+## Testing
 
-### Data Preparation (`prepare/prepare_data.py`)
+```bash
+# Unit tests
+python -m pytest swe_agent/tests/ -v --ignore=swe_agent/tests/test_integration_swebench.py
 
-Two modes:
-- **`simple`**: Generates small synthetic tasks (rename file, create file, fix bug) for pipeline testing
-- **`swebench`**: Loads SWE-bench Lite instances with real GitHub issues and patches
+# Integration tests (requires real data)
+python -m pytest swe_agent/tests/test_integration_swebench.py -v -m integration
+```
 
 ## Troubleshooting
 
-| Problem | Cause | Fix |
-|---------|-------|-----|
-| Training exits at 100% immediately | Old checkpoint matches `total_epochs` | `rm -rf $WORK_BASE/checkpoints/$EXPERIMENT_NAME/` |
-| Fixed proxy port already in use (`port > 0`) | ModelProxy falls back to next port (`port+1`, ...) | Keep `port: 0` (recommended) or increase `max_port_retries` |
-| SWE-Agent TimeoutError | Docker container startup timeout | Pre-pull: `docker pull swerex-python:3.11` |
-| OOM during rollout | Too many concurrent Docker containers | Reduce `train_batch_size` or `docker_memory_limit` |
-| No patch found | Agent didn't run `submit` | Increase `max_turns` or improve system prompt |
+See the [Integration Guide Troubleshooting](docs/swe_bench_verified_integration.md#troubleshooting) section for common issues and solutions.
 
-### Emergency Cleanup
+### Common Issues
 
-```bash
-# Stop all SWE-Agent Docker containers
-docker ps --filter "ancestor=swerex-python:3.11" -q | xargs -r docker stop
+- **Docker image not found**: Use `--skip_missing_images` or build missing images
+- **Container fails to start**: Check Docker daemon, image existence, disk space
+- **Low reward scores**: Check agent logs, patch format, timeout settings
+- **Import errors**: Use `python -m` to run as modules
 
-# Force stop Ray
-ray stop --force
+## References
 
-# Kill training process
-pkill -9 -f main_ppo
-```
+- [SWE-bench Paper](https://arxiv.org/abs/2310.06770)
+- [SWE-bench GitHub](https://github.com/princeton-nlp/SWE-bench)
+- [VERL Documentation](https://github.com/volcengine/verl)
+- [SWE-Agent](https://github.com/princeton-nlp/SWE-agent)
 
-## Extending
+## License
 
-### Custom Tasks
-
-Create your own training data by adding new task generators in `prepare/prepare_data.py`. Each task needs:
-- `problem_statement`: Natural language description
-- `repo_content`: Dict mapping file paths to content (the starting codebase)
-- `expected_patch`: The correct unified diff
-
-### Custom Reward Functions
-
-Replace or extend `reward/reward.py`. The function signature is:
-
-```python
-def compute_score(solution_str, ground_truth, extra_info=None, **kwargs):
-    """Returns a float reward in [0, 1]."""
-```
-
-### Custom Templates
-
-Override prompt templates per-instance via `extra_info.agent_overrides.templates` or globally in `swe_agent_config.yaml`.
+Copyright 2026 Bytedance Ltd. and/or its affiliates. Licensed under the Apache License, Version 2.0.
