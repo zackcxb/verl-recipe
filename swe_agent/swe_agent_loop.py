@@ -129,6 +129,12 @@ class SWEAgentLoop(AgentLoopBase):
         # ── 2. Per-instance config (data-affine overrides) ──
         run_cfg = apply_data_overrides(self.runtime_config, extra_info)
 
+        # Log Docker image usage
+        if run_cfg.docker_image != self.runtime_config.docker_image:
+            logger.info(f"Using per-instance Docker image: {run_cfg.docker_image}")
+        else:
+            logger.debug(f"Using default Docker image: {run_cfg.docker_image}")
+
         # ── 3. Temp repo ──
         temp_repo_dir = None
         if repo_content and not repo_path:
