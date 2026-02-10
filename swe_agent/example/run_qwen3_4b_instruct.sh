@@ -38,6 +38,7 @@ echo "==========================================="
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECIPE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VERL_ROOT="$(cd "$RECIPE_DIR/../.." && pwd)"
+export PYTHONPATH="$VERL_ROOT:${PYTHONPATH:-}"
 
 # ========== Model config ==========
 # [CONFIGURE] Set MODEL_PATH to your local model directory or HuggingFace model id.
@@ -92,6 +93,13 @@ export HYDRA_FULL_ERROR=1
 export NCCL_DEBUG=WARN
 export VLLM_USE_V1=1
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+# Ensure Triton/gcc can find libcuda when building runtime modules.
+# Some environments only expose libcuda.so.1 in system dirs, while link step needs -lcuda.
+CUDA_COMPAT_DIR=/usr/local/cuda/compat
+CUDA_STUB_DIR=/usr/local/cuda/targets/x86_64-linux/lib/stubs
+if [ -d "$CUDA_COMPAT_DIR" ] || [ -d "$CUDA_STUB_DIR" ]; then
+    export LIBRARY_PATH="$CUDA_COMPAT_DIR:$CUDA_STUB_DIR:${LIBRARY_PATH:-}"
+fi
 # Fix /dev/shm space issue - use alternative communication methods
 export NCCL_SHM_DISABLE=1
 export NCCL_P2P_DISABLE=1
@@ -168,6 +176,7 @@ fi
 echo ""
 
 python3.12 -m verl.trainer.main_ppo \
+    +ray_kwargs.ray_init.runtime_env.env_vars.LIBRARY_PATH="$LIBRARY_PATH" \
     algorithm.adv_estimator=$adv_estimator \
     algorithm.use_kl_in_reward=$use_kl_in_reward \
     algorithm.kl_ctrl.kl_coef=$kl_coef \
