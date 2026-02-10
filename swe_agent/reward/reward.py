@@ -149,15 +149,15 @@ def compute_score(
     compute_score.
 
     Args:
-        data_source: Dataset identifier (e.g. "swe_agent_simple").
+        data_source: Dataset identifier (e.g. "swe_agent_simple", "swe_bench_verified").
         solution_str: Decoded model response (NOT the patch for SWE-agent).
-        ground_truth: Expected answer / patch.
+        ground_truth: Expected answer / patch. Can be string or dict with "ground_truth" or "gold_patch" key.
         extra_info: Extra fields from agent loop, including "patch".
 
     Returns:
         Reward score as float.
     """
-    if data_source in ("swe_agent_simple", "swe_agent", "swe_bench", "swe_bench_lite"):
+    if data_source in ("swe_agent_simple", "swe_agent", "swe_bench", "swe_bench_lite", "swe_bench_verified"):
         # Extract the actual patch from extra_info
         generated_patch = None
         if extra_info is not None:
