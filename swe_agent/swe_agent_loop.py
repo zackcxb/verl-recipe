@@ -163,6 +163,12 @@ class SWEAgentLoop(AgentLoopBase):
                 )
                 self.sandbox_config[key] = default_val
 
+        output_dir = str(self.sandbox_config["output_dir"])
+        output_dir = os.path.abspath(os.path.expanduser(output_dir))
+        self.sandbox_config["output_dir"] = output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"SWE Agent output_dir resolved to: {output_dir}")
+
         logger.info(
             f"SWE Agent Loop initialized ("
             f"deployment_type={self.sandbox_config['deployment_type']}, "
@@ -262,6 +268,12 @@ class SWEAgentLoop(AgentLoopBase):
             patch = None
             max_turns = self.sandbox_config["max_turns"]
             max_turns_reached = False
+            total_wait_request_time = 0.0
+            total_tool_obs_tokenize_time = 0.0
+            total_prompt_build_time = 0.0
+            total_llm_gen_time = 0.0
+            total_proxy_send_time = 0.0
+            total_turn_exec_time = 0.0
             logger.info(f"Agent loop started with max_turns={max_turns}")
 
             # Main interaction loop
@@ -283,6 +295,7 @@ class SWEAgentLoop(AgentLoopBase):
                     break
 
                 # Create a task for getting the next model request
+                request_wait_start_time = time.time()
                 request_task = asyncio.create_task(self.model_proxy.get_request())
 
                 # Race: wait for EITHER a model request OR agent task completion
@@ -338,7 +351,13 @@ class SWEAgentLoop(AgentLoopBase):
                         logger.exception(f"Error getting model request: {e}")
                         continue
 
+                    request_wait_elapsed = time.time() - request_wait_start_time
+                    total_wait_request_time += request_wait_elapsed
+
                     turn_start_time = time.time()
+                    tool_obs_tokenize_elapsed = 0.0
+                    prompt_build_elapsed = 0.0
+                    proxy_send_elapsed = 0.0
 
                     # Normalize OpenAI messages for HF chat template
                     messages = self._normalize_openai_messages(model_request.messages)
@@ -357,11 +376,14 @@ class SWEAgentLoop(AgentLoopBase):
                         new_msgs = messages[len(prev_messages) :]
                         tool_msgs = [m for m in new_msgs if m.get("role") != "assistant"]
                         if tool_msgs:
+                            tool_tokenize_start_time = time.time()
                             tool_token_ids = self.tokenizer.apply_chat_template(
                                 tool_msgs,
                                 add_generation_prompt=False,
                                 tokenize=True,
                             )
+                            tool_obs_tokenize_elapsed = time.time() - tool_tokenize_start_time
+                            total_tool_obs_tokenize_time += tool_obs_tokenize_elapsed
                             all_response_ids.extend(tool_token_ids)
                             all_response_mask.extend([0] * len(tool_token_ids))
                             all_response_logprobs.extend([0.0] * len(tool_token_ids))
@@ -370,7 +392,10 @@ class SWEAgentLoop(AgentLoopBase):
                             )
 
                     # Generate response using VERL's server_manager
+                    prompt_build_start_time = time.time()
                     prompt_ids = await self.apply_chat_template(messages)
+                    prompt_build_elapsed = time.time() - prompt_build_start_time
+                    total_prompt_build_time += prompt_build_elapsed
                     request_id = str(uuid.uuid4())
 
                     # Truncate prompt_ids to fit within vLLM max_model_len.
@@ -407,6 +432,7 @@ class SWEAgentLoop(AgentLoopBase):
                         sampling_params=sampling_params_with_logprobs,
                     )
                     gen_elapsed = time.time() - gen_start_time
+                    total_llm_gen_time += gen_elapsed
 
                     response_ids = output.token_ids
                     # Skip special tokens to avoid confusing SWE-Agent's parser
@@ -427,19 +453,25 @@ class SWEAgentLoop(AgentLoopBase):
                     prev_messages = messages
 
                     # Send response back to SWE-Agent
+                    send_start_time = time.time()
                     await self.model_proxy.send_response(
                         response_text,
                         request=model_request,
                     )
+                    proxy_send_elapsed = time.time() - send_start_time
+                    total_proxy_send_time += proxy_send_elapsed
 
                     turn_elapsed = time.time() - turn_start_time
+                    total_turn_exec_time += turn_elapsed
                     n_model_tokens = len(response_ids)
                     n_total = len(all_response_ids)
                     n_mask1 = sum(all_response_mask)
                     logger.info(
                         f"Turn {num_turns}: {n_model_tokens} model tokens, "
                         f"total_seq={n_total} (mask=1: {n_mask1}, mask=0: {n_total - n_mask1}), "
-                        f"gen={gen_elapsed:.1f}s, turn_total={turn_elapsed:.1f}s"
+                        f"wait_req={request_wait_elapsed:.1f}s, prompt={prompt_build_elapsed:.1f}s, "
+                        f"tool_obs={tool_obs_tokenize_elapsed:.1f}s, gen={gen_elapsed:.1f}s, "
+                        f"proxy_send={proxy_send_elapsed:.1f}s, turn_total={turn_elapsed:.1f}s"
                     )
 
                     if max_turns is not None and num_turns >= int(max_turns):
@@ -467,10 +499,24 @@ class SWEAgentLoop(AgentLoopBase):
                         patch = None
 
             total_elapsed = time.time() - run_start_time
+            turn_overhead_time = max(total_turn_exec_time - total_llm_gen_time - total_proxy_send_time, 0.0)
+            post_loop_time = max(total_elapsed - total_wait_request_time - total_turn_exec_time, 0.0)
+
+            def _pct(v: float) -> float:
+                return 100.0 * v / total_elapsed if total_elapsed > 1e-9 else 0.0
+
             logger.info(
-                f"SWE Agent Loop completed: {num_turns} turns, "
-                f"patch={'yes' if patch else 'no'}, total={total_elapsed:.1f}s"
+                "SWE Agent latency summary: "
+                f"total={total_elapsed:.1f}s, "
+                f"llm_gen={total_llm_gen_time:.1f}s ({_pct(total_llm_gen_time):.1f}%), "
+                f"proxy_comm={total_proxy_send_time:.1f}s ({_pct(total_proxy_send_time):.1f}%), "
+                f"agent_env_wait={total_wait_request_time:.1f}s ({_pct(total_wait_request_time):.1f}%), "
+                f"turn_overhead={turn_overhead_time:.1f}s ({_pct(turn_overhead_time):.1f}%), "
+                f"post_loop={post_loop_time:.1f}s ({_pct(post_loop_time):.1f}%), "
+                f"prompt_build={total_prompt_build_time:.1f}s, tool_obs_tokenize={total_tool_obs_tokenize_time:.1f}s"
             )
+            logger.info(f"SWE Agent Loop completed: {num_turns} turns, "
+                       f"patch={'yes' if patch else 'no'}, total={total_elapsed:.1f}s")
 
             # Build AgentLoopOutput
             # Structure (mirrors tool_agent_loop.py):
@@ -925,14 +971,31 @@ class SWEAgentLoop(AgentLoopBase):
                 return None
 
             subprocess_elapsed = time.time() - subprocess_start
+            stdout_text = stdout.decode(errors='replace')
+            stderr_text = stderr.decode(errors='replace')
 
+            try:
+                os.makedirs(output_dir, exist_ok=True)
+                stdout_path = os.path.join(output_dir, f"{instance_id}.stdout.log")
+                stderr_path = os.path.join(output_dir, f"{instance_id}.stderr.log")
+                with open(stdout_path, "w", encoding="utf-8") as stdout_file:
+                    stdout_file.write(stdout_text)
+                with open(stderr_path, "w", encoding="utf-8") as stderr_file:
+                    stderr_file.write(stderr_text)
+                logger.info(
+                    f"[{instance_id}] Saved SWE-Agent subprocess logs: "
+                    f"stdout={stdout_path}, stderr={stderr_path}"
+                )
+            except Exception as log_save_error:
+                logger.warning(
+                    f"[{instance_id}] Failed to save subprocess logs to output dir: {log_save_error}"
+                )
+            
             if process.returncode != 0:
                 logger.error(
                     f"[{instance_id}] SWE-Agent failed (rc={process.returncode}) after {subprocess_elapsed:.1f}s"
                 )
                 # Log stderr (last 2000 chars to avoid flooding)
-                stderr_text = stderr.decode(errors="replace")
-                stdout_text = stdout.decode(errors="replace")
                 logger.error(f"[{instance_id}] stderr (last 2000): {stderr_text[-2000:]}")
                 logger.error(f"[{instance_id}] stdout (last 1000): {stdout_text[-1000:]}")
                 # Still try to extract patch even if process failed
