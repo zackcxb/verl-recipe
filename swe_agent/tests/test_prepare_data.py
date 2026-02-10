@@ -1,7 +1,7 @@
 import json
 import pandas as pd
 import pytest
-from swe_agent.prepare.prepare_data import load_swebench_verified
+from swe_agent.prepare.load_swebench import load_swebench_verified
 
 
 def test_load_swebench_verified_basic(tmp_path, mocker):
@@ -27,7 +27,7 @@ def test_load_swebench_verified_basic(tmp_path, mocker):
     test_data.to_parquet(parquet_path)
 
     # Mock Docker image check to return True
-    mocker.patch("swe_agent.prepare.prepare_data.check_docker_image_exists", return_value=True)
+    mocker.patch("swe_agent.prepare.load_swebench.check_docker_image_exists", return_value=True)
 
     # Load data
     result = load_swebench_verified(
@@ -83,7 +83,7 @@ def test_skip_missing_images(tmp_path, mocker):
     def mock_check(image_name):
         return "111" in image_name or "333" in image_name
 
-    mocker.patch("swe_agent.prepare.prepare_data.check_docker_image_exists", side_effect=mock_check)
+    mocker.patch("swe_agent.prepare.load_swebench.check_docker_image_exists", side_effect=mock_check)
 
     # Load with skip_missing_images=True
     result = load_swebench_verified(
