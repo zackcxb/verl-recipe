@@ -12,175 +12,146 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-SWE Agent Dataset Generator
+SWE Agent Dataset Generator.
 
 Supports two data sources:
 1. Simple test cases (for quick validation)
 2. SWE-bench Lite (for full evaluation)
 
 Data format is VERL-compatible:
-- prompt: Conversation format containing problem_statement
+- prompt: Minimal chat messages (satisfies framework's ``raw_prompt`` requirement).
+          The *real* system/instance templates are applied at runtime by
+          SWE-Agent via ``swe_agent_config.yaml`` — this avoids duplicating
+          prompt templates between data preparation and runtime.
 - reward_model: Evaluation configuration
-- extra_info: Contains repo_content, expected_patch, etc.
+- extra_info: Contains problem_statement, repo_content, expected_patch,
+              and data-affine overrides (sandbox_overrides / agent_overrides).
 - agent_name: "swe_agent"
+
+Data-affine override mechanism:
+  extra_info may contain two special dicts that override swe_agent_config.yaml
+  defaults at runtime (per-instance granularity):
+
+  - sandbox_overrides: e.g. {"docker_image": "...", "max_steps": 50}
+  - agent_overrides:   e.g. {"templates": {"system_template": "..."}}
+
+  See swe_agent_config.yaml for the full list (marked [DATA-AFFINE]).
 """
 
 import argparse
 import json
 import os
-from typing import Optional
+from typing import Any
 
 import pandas as pd
 
-# SWE-Agent system prompt
-SWE_AGENT_SYSTEM_PROMPT = (
-    "You are a helpful assistant that can interact with a computer"
-    " to solve software engineering tasks.\n\n"
-    "When working on a task:\n"
-    "1. First understand the problem by reading relevant code\n"
-    "2. Make minimal changes to fix the issue\n"
-    "3. Verify your changes work correctly\n\n"
-    "Your goal is to create a patch that resolves the issue"
-    " described in the problem statement."
-)
+# ---------------------------------------------------------------------------
+# Prompt helper
+# ---------------------------------------------------------------------------
 
 
-def create_swe_prompt(problem_statement: str, repo_info: Optional[dict] = None) -> list[dict[str, str]]:
-    """Create SWE-Agent prompt format.
+def _make_minimal_prompt(problem_statement: str) -> list[dict[str, str]]:
+    """Create a minimal prompt that satisfies VERL's ``raw_prompt`` requirement.
+
+    The real system/instance templates are injected by SWE-Agent at runtime
+    (via swe_agent_config.yaml).  This prompt is only used for:
+      - ``_agent_loop_postprocess`` (stores ``raw_prompt`` in extra_fields)
+      - The reward loop (reconstructs the chat for RM scoring)
 
     Args:
-        problem_statement: Problem description.
-        repo_info: Optional repository information.
+        problem_statement: Problem description text.
 
     Returns:
-        Prompt in conversation format.
+        Minimal conversation in ``[{role, content}]`` format.
     """
-    user_content = f"""<problem_statement>
-{problem_statement}
-</problem_statement>
-
-Please analyze the problem and implement the necessary changes to resolve it.
-Make minimal changes to the codebase while ensuring the issue is fully addressed."""
-
-    if repo_info:
-        repo_name = repo_info.get("repo_name", "unknown")
-        base_commit = repo_info.get("base_commit", "")
-        user_content = f"""Repository: {repo_name}
-Base commit: {base_commit}
-
-{user_content}"""
-
-    return [
-        {"role": "system", "content": SWE_AGENT_SYSTEM_PROMPT},
-        {"role": "user", "content": user_content},
-    ]
+    return [{"role": "user", "content": problem_statement}]
 
 
-def generate_simple_test_data(num_samples: int, split: str, agent_name: str = "swe_agent") -> pd.DataFrame:
-    """Generate simple test data (for quick validation).
+# ---------------------------------------------------------------------------
+# Simple test data
+# ---------------------------------------------------------------------------
 
-    Args:
-        num_samples: Number of samples.
-        split: Dataset split (train/test).
-        agent_name: Agent name.
 
-    Returns:
-        Dataset in DataFrame format.
-    """
-    rl_dataset = {
-        "prompt": [],
-        "data_source": [],
-        "ability": [],
-        "reward_model": [],
-        "extra_info": [],
-        "agent_name": [],
-    }
+def generate_simple_test_data(
+    num_samples: int,
+    split: str,
+    agent_name: str = "swe_agent",
+) -> pd.DataFrame:
+    """Generate simple test data for quick validation."""
 
-    # Simple test case: file rename
     test_cases = [
         {
             "problem_statement": "rename 1.txt to 2.txt",
             "repo_content": {"1.txt": "Hello World"},
-            "expected_patch": """diff --git a/1.txt b/2.txt
-similarity index 100%
-rename from 1.txt
-rename to 2.txt""",
+            "expected_patch": ("diff --git a/1.txt b/2.txt\nsimilarity index 100%\nrename from 1.txt\nrename to 2.txt"),
         },
         {
             "problem_statement": "Create a new file called hello.py that prints 'Hello, World!'",
             "repo_content": {},
-            "expected_patch": """diff --git a/hello.py b/hello.py
-new file mode 100644
---- /dev/null
-+++ b/hello.py
-@@ -0,0 +1 @@
-+print('Hello, World!')""",
+            "expected_patch": (
+                "diff --git a/hello.py b/hello.py\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/hello.py\n"
+                "@@ -0,0 +1 @@\n"
+                "+print('Hello, World!')"
+            ),
         },
         {
-            "problem_statement": "Fix the bug in calculator.py: the add function should return a + b, not a - b",
+            "problem_statement": ("Fix the bug in calculator.py: the add function should return a + b, not a - b"),
             "repo_content": {"calculator.py": "def add(a, b):\n    return a - b"},
-            "expected_patch": """diff --git a/calculator.py b/calculator.py
---- a/calculator.py
-+++ b/calculator.py
-@@ -1,2 +1,2 @@
- def add(a, b):
--    return a - b
-+    return a + b""",
+            "expected_patch": (
+                "diff --git a/calculator.py b/calculator.py\n"
+                "--- a/calculator.py\n"
+                "+++ b/calculator.py\n"
+                "@@ -1,2 +1,2 @@\n"
+                " def add(a, b):\n"
+                "-    return a - b\n"
+                "+    return a + b"
+            ),
         },
     ]
 
+    rows: list[dict[str, Any]] = []
     for idx in range(num_samples):
         case = test_cases[idx % len(test_cases)]
+        rows.append(
+            {
+                "prompt": _make_minimal_prompt(case["problem_statement"]),
+                "data_source": "swe_agent_simple",
+                "ability": "software_engineering",
+                "reward_model": {
+                    "style": "swe_agent",
+                    "ground_truth": case["expected_patch"],
+                },
+                "extra_info": {
+                    "index": idx,
+                    "split": split,
+                    "repo_content": case["repo_content"],
+                    "expected_patch": case["expected_patch"],
+                    "problem_statement": case["problem_statement"],
+                    # Data-affine overrides — simple tasks use smaller limits.
+                    "sandbox_overrides": {"max_steps": 10, "max_turns": 8},
+                },
+                "agent_name": agent_name,
+            }
+        )
 
-        # Create prompt
-        prompt = create_swe_prompt(case["problem_statement"])
-
-        # Reward model config
-        reward_model = {
-            "style": "swe_agent",
-            "ground_truth": case["expected_patch"],
-        }
-
-        # Extra info
-        extra_info = {
-            "index": idx,
-            "split": split,
-            "repo_content": case["repo_content"],
-            "expected_patch": case["expected_patch"],
-            "problem_statement": case["problem_statement"],
-        }
-
-        rl_dataset["prompt"].append(prompt)
-        rl_dataset["data_source"].append("swe_agent_simple")
-        rl_dataset["ability"].append("software_engineering")
-        rl_dataset["reward_model"].append(reward_model)
-        rl_dataset["extra_info"].append(extra_info)
-        rl_dataset["agent_name"].append(agent_name)
-
-    return pd.DataFrame(data=rl_dataset)
+    return pd.DataFrame(rows)
 
 
-def load_swebench_lite(swebench_path: str, split: str, agent_name: str = "swe_agent") -> pd.DataFrame:
-    """Load SWE-bench Lite dataset.
+# ---------------------------------------------------------------------------
+# SWE-bench Lite
+# ---------------------------------------------------------------------------
 
-    Args:
-        swebench_path: Path to SWE-bench data file.
-        split: Dataset split.
-        agent_name: Agent name.
 
-    Returns:
-        Dataset in DataFrame format.
-    """
-    rl_dataset = {
-        "prompt": [],
-        "data_source": [],
-        "ability": [],
-        "reward_model": [],
-        "extra_info": [],
-        "agent_name": [],
-    }
+def load_swebench_lite(
+    swebench_path: str,
+    split: str,
+    agent_name: str = "swe_agent",
+) -> pd.DataFrame:
+    """Load SWE-bench Lite dataset."""
 
-    # Read SWE-bench data
     if swebench_path.endswith(".json"):
         with open(swebench_path) as f:
             data = json.load(f)
@@ -192,69 +163,79 @@ def load_swebench_lite(swebench_path: str, split: str, agent_name: str = "swe_ag
     else:
         raise ValueError(f"Unsupported file format: {swebench_path}")
 
+    rows: list[dict[str, Any]] = []
     for idx, item in enumerate(data):
         instance_id = item.get("instance_id", f"instance_{idx}")
         problem_statement = item.get("problem_statement", "")
 
-        # Repository info
-        repo_info = {
-            "repo_name": item.get("repo", ""),
-            "base_commit": item.get("base_commit", ""),
-        }
+        # Per-instance sandbox overrides
+        sandbox_overrides: dict[str, Any] = {}
+        if item.get("docker_image"):
+            sandbox_overrides["docker_image"] = item["docker_image"]
+        if item.get("max_steps"):
+            sandbox_overrides["max_steps"] = item["max_steps"]
 
-        # Create prompt
-        prompt = create_swe_prompt(problem_statement, repo_info)
+        # Per-instance agent overrides (templates)
+        agent_overrides: dict[str, Any] = {}
+        if item.get("system_template"):
+            agent_overrides.setdefault("templates", {})["system_template"] = item["system_template"]
+        if item.get("instance_template"):
+            agent_overrides.setdefault("templates", {})["instance_template"] = item["instance_template"]
 
-        # Reward model config
-        reward_model = {
-            "style": "swe_bench",
-            "instance_id": instance_id,
-            "test_patch": item.get("test_patch", ""),
-            "gold_patch": item.get("patch", ""),
-        }
+        rows.append(
+            {
+                "prompt": _make_minimal_prompt(problem_statement),
+                "data_source": "swe_bench_lite",
+                "ability": "software_engineering",
+                "reward_model": {
+                    "style": "swe_bench",
+                    "instance_id": instance_id,
+                    "test_patch": item.get("test_patch", ""),
+                    "gold_patch": item.get("patch", ""),
+                },
+                "extra_info": {
+                    "index": idx,
+                    "split": split,
+                    "instance_id": instance_id,
+                    "repo": item.get("repo", ""),
+                    "base_commit": item.get("base_commit", ""),
+                    "problem_statement": problem_statement,
+                    "hints_text": item.get("hints_text", ""),
+                    "created_at": item.get("created_at", ""),
+                    "version": item.get("version", ""),
+                    "FAIL_TO_PASS": item.get("FAIL_TO_PASS", ""),
+                    "PASS_TO_PASS": item.get("PASS_TO_PASS", ""),
+                    "sandbox_overrides": sandbox_overrides,
+                    "agent_overrides": agent_overrides,
+                },
+                "agent_name": agent_name,
+            }
+        )
 
-        # Extra info
-        extra_info = {
-            "index": idx,
-            "split": split,
-            "instance_id": instance_id,
-            "repo": item.get("repo", ""),
-            "base_commit": item.get("base_commit", ""),
-            "problem_statement": problem_statement,
-            "hints_text": item.get("hints_text", ""),
-            "created_at": item.get("created_at", ""),
-            "version": item.get("version", ""),
-            "FAIL_TO_PASS": item.get("FAIL_TO_PASS", ""),
-            "PASS_TO_PASS": item.get("PASS_TO_PASS", ""),
-        }
-
-        rl_dataset["prompt"].append(prompt)
-        rl_dataset["data_source"].append("swe_bench_lite")
-        rl_dataset["ability"].append("software_engineering")
-        rl_dataset["reward_model"].append(reward_model)
-        rl_dataset["extra_info"].append(extra_info)
-        rl_dataset["agent_name"].append(agent_name)
-
-    return pd.DataFrame(data=rl_dataset)
+    return pd.DataFrame(rows)
 
 
-def main():
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(description="SWE Agent Dataset Generator")
     parser.add_argument(
         "--mode",
         choices=["simple", "swebench"],
         default="simple",
-        help="Data generation mode: 'simple' for test cases, 'swebench' for SWE-bench Lite",
+        help="Data generation mode",
     )
-    parser.add_argument("--train_size", type=int, default=100, help="Number of training samples (for simple mode)")
-    parser.add_argument("--test_size", type=int, default=10, help="Number of testing samples (for simple mode)")
-    parser.add_argument("--swebench_train", type=str, default=None, help="Path to SWE-bench train data")
-    parser.add_argument("--swebench_test", type=str, default=None, help="Path to SWE-bench test data")
-    parser.add_argument("--output_dir", default="data/swe_agent", help="Directory to save the dataset")
-    parser.add_argument("--agent_name", default="swe_agent", help="Name of the agent")
+    parser.add_argument("--train_size", type=int, default=100)
+    parser.add_argument("--test_size", type=int, default=10)
+    parser.add_argument("--swebench_train", type=str, default=None)
+    parser.add_argument("--swebench_test", type=str, default=None)
+    parser.add_argument("--output_dir", default="data/swe_agent")
+    parser.add_argument("--agent_name", default="swe_agent")
     args = parser.parse_args()
 
-    # Ensure output directory exists
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Check pyarrow
@@ -264,43 +245,27 @@ def main():
         if importlib.util.find_spec("pyarrow") is None:
             raise ImportError("pyarrow not found")
     except ImportError as err:
-        raise ImportError(
-            "pyarrow is required for parquet support. Please install it with: pip install pyarrow"
-        ) from err
+        raise ImportError("pyarrow is required for parquet support. Install with: pip install pyarrow") from err
 
     if args.mode == "simple":
-        # Generate simple test data
         print("Generating simple test data...")
-        train_dataset = generate_simple_test_data(args.train_size, "train", args.agent_name)
-        test_dataset = generate_simple_test_data(args.test_size, "test", args.agent_name)
+        train_df = generate_simple_test_data(args.train_size, "train", args.agent_name)
+        test_df = generate_simple_test_data(args.test_size, "test", args.agent_name)
     else:
-        # Load SWE-bench data
         print("Loading SWE-bench Lite data...")
         if args.swebench_train is None or args.swebench_test is None:
             raise ValueError("--swebench_train and --swebench_test are required for swebench mode")
-        train_dataset = load_swebench_lite(args.swebench_train, "train", args.agent_name)
-        test_dataset = load_swebench_lite(args.swebench_test, "test", args.agent_name)
+        train_df = load_swebench_lite(args.swebench_train, "train", args.agent_name)
+        test_df = load_swebench_lite(args.swebench_test, "test", args.agent_name)
 
-    # Save dataset
     train_path = os.path.join(args.output_dir, "train.parquet")
     test_path = os.path.join(args.output_dir, "test.parquet")
-
-    train_dataset.to_parquet(train_path)
-    test_dataset.to_parquet(test_path)
+    train_df.to_parquet(train_path)
+    test_df.to_parquet(test_path)
 
     print("\nDataset generation completed!")
-    print(f"Train dataset: {len(train_dataset)} samples -> {train_path}")
-    print(f"Test dataset: {len(test_dataset)} samples -> {test_path}")
-
-    # Print dataset sample
-    print("\n=== Sample data ===")
-    print("Columns:", list(train_dataset.columns))
-    if len(train_dataset) > 0:
-        sample = train_dataset.iloc[0]
-        print("\nFirst sample:")
-        print(f"  prompt: {str(sample['prompt'])[:200]}...")
-        print(f"  data_source: {sample['data_source']}")
-        print(f"  agent_name: {sample['agent_name']}")
+    print(f"Train: {len(train_df)} samples -> {train_path}")
+    print(f"Test:  {len(test_df)} samples -> {test_path}")
 
 
 if __name__ == "__main__":

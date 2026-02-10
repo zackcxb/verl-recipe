@@ -214,7 +214,7 @@ python3.12 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_p=0.6 \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.n=$n_resp_per_prompt_val \
-    custom_reward_function.path="${RECIPE_DIR}/reward/compute_score.py" \
+    custom_reward_function.path="${RECIPE_DIR}/reward/reward.py" \
     custom_reward_function.name=compute_score \
     trainer.logger='["console"]' \
     trainer.project_name=$project_name \

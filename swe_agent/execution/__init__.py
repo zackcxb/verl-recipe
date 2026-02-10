@@ -11,16 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""SWE Agent Reward Functions."""
 
-from .reward import (
-    compare_patches_simple,
-    compute_score,
-    normalize_patch,
-)
+"""SWE-Agent subprocess execution and Docker lifecycle management."""
+
+from .container_cleanup import cleanup_instance_containers
+from .subprocess_runner import execute_swe_agent
 
 __all__ = [
-    "compute_score",
-    "compare_patches_simple",
-    "normalize_patch",
+    "execute_swe_agent",
+    "cleanup_instance_containers",
 ]
