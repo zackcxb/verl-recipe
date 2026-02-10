@@ -12,6 +12,7 @@ Both loaders produce VERL-compatible DataFrames with:
 """
 
 import json
+import logging
 from typing import Any
 
 import pandas as pd
@@ -21,6 +22,8 @@ try:
     from ..utils.docker_utils import build_image_name, check_docker_image_exists
 except ImportError:
     from swe_agent.utils.docker_utils import build_image_name, check_docker_image_exists
+
+logger = logging.getLogger(__name__)
 
 
 def _make_minimal_prompt(problem_statement: str) -> list[dict[str, str]]:
@@ -178,13 +181,15 @@ def load_swebench_verified(
         if isinstance(fail_to_pass, str):
             try:
                 fail_to_pass = json.loads(fail_to_pass) if fail_to_pass else []
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse FAIL_TO_PASS for {instance_id}: {e}")
                 fail_to_pass = []
 
         if isinstance(pass_to_pass, str):
             try:
                 pass_to_pass = json.loads(pass_to_pass) if pass_to_pass else []
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse PASS_TO_PASS for {instance_id}: {e}")
                 pass_to_pass = []
 
         # Reward model config for SWE-bench evaluation
@@ -231,6 +236,6 @@ def load_swebench_verified(
         )
 
     if skip_missing_images and skipped_count > 0:
-        print(f"Skipped {skipped_count} instances with missing Docker images")
+        logger.info(f"Skipped {skipped_count} instances with missing Docker images")
 
     return pd.DataFrame(rows)
