@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from recipe.swe_agent.config.config_builder import SWEAgentConfigBuilder
+from recipe.swe_agent.config.yaml_builder import SWEAgentYAMLBuilder
 
 
-def test_config_builder_creates_valid_yaml():
-    """Test that config builder produces valid SWE-Agent YAML."""
-    builder = SWEAgentConfigBuilder(
+def test_yaml_builder_creates_valid_config():
+    """Test that YAML builder produces valid SWE-Agent config."""
+    builder = SWEAgentYAMLBuilder(
         instance_id="test-123",
         repo_path="/workspace/repo",
         output_dir="/tmp/output",
@@ -35,9 +35,9 @@ def test_config_builder_creates_valid_yaml():
     assert config["agent"]["tools"]["execution_timeout"] == 300
 
 
-def test_config_builder_to_yaml_string():
+def test_yaml_builder_to_yaml_string():
     """Test YAML serialization."""
-    builder = SWEAgentConfigBuilder(
+    builder = SWEAgentYAMLBuilder(
         instance_id="test-123",
         repo_path="/workspace",
         output_dir="/tmp",
@@ -52,9 +52,9 @@ def test_config_builder_to_yaml_string():
     assert isinstance(yaml_str, str)
 
 
-def test_config_builder_custom_templates():
+def test_yaml_builder_custom_templates():
     """Test custom template support."""
-    builder = SWEAgentConfigBuilder(
+    builder = SWEAgentYAMLBuilder(
         instance_id="test",
         repo_path="/workspace",
         output_dir="/tmp",

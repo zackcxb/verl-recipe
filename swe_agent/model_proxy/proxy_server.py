@@ -123,6 +123,7 @@ class ModelProxy:
                 self.port = port
 
             # Try to bind to port, with automatic fallback to next ports
+            # TODO 并发数大，port选择逻辑优化
             initial_port = self.port
             for attempt in range(max_retries):
                 try:

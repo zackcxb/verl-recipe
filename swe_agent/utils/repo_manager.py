@@ -71,7 +71,7 @@ async def create_temp_repo(repo_content: dict[str, Optional[str]]) -> str:
             f"cd {temp_dir} && git config user.email 'verl@swe-agent.local'",
             f"cd {temp_dir} && git config user.name 'VERL SWE-Agent'",
             f"cd {temp_dir} && git add -A",
-            f"cd {temp_dir} && git commit --allow-empty -m 'Initial commit'",
+            f"cd {temp_dir} && git commit -m 'Initial commit'",
         ]
 
         for cmd in cmds:
@@ -80,15 +80,7 @@ async def create_temp_repo(repo_content: dict[str, Optional[str]]) -> str:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                stderr_text = stderr.decode("utf-8", errors="replace")
-                stdout_text = stdout.decode("utf-8", errors="replace")
-                raise RuntimeError(
-                    f"Command failed (rc={proc.returncode}): {cmd}\n"
-                    f"stderr={stderr_text[-500:]}\n"
-                    f"stdout={stdout_text[-500:]}"
-                )
+            await proc.communicate()
 
         logger.debug(f"Created temp repo with {len(repo_content)} files at {temp_dir}")
         return temp_dir

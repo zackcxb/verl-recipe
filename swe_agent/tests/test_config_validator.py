@@ -1,5 +1,5 @@
 import pytest
-from recipe.swe_agent.config.config_validator import AgentConfigValidator, ConfigValidationError
+from recipe.swe_agent.config.validator import AgentConfigValidator, ConfigValidationError
 
 
 def test_validator_accepts_valid_config():
