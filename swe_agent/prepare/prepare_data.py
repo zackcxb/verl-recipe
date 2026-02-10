@@ -45,6 +45,12 @@ from typing import Any
 
 import pandas as pd
 
+# Handle imports for both module and script execution
+try:
+    from ..utils.docker_utils import build_image_name, check_docker_image_exists
+except ImportError:
+    from swe_agent.utils.docker_utils import build_image_name, check_docker_image_exists
+
 # ---------------------------------------------------------------------------
 # Prompt helper
 # ---------------------------------------------------------------------------
@@ -216,6 +222,119 @@ def load_swebench_lite(
 
 
 # ---------------------------------------------------------------------------
+# SWE-bench_Verified data
+# ---------------------------------------------------------------------------
+
+
+def load_swebench_verified(
+    swebench_path: str,
+    split: str,
+    agent_name: str = "swe_agent",
+    skip_missing_images: bool = False,
+    arch: str = "x86_64",
+) -> pd.DataFrame:
+    """Load SWE-bench_Verified dataset.
+
+    Args:
+        swebench_path: Path to SWE-bench_Verified parquet file.
+        split: Dataset split (train/test/val).
+        agent_name: Agent name.
+        skip_missing_images: If True, filter out instances with missing Docker images.
+        arch: Docker image architecture (default: x86_64).
+
+    Returns:
+        Dataset in DataFrame format compatible with VERL.
+    """
+    rows: list[dict[str, Any]] = []
+
+    # Read SWE-bench_Verified parquet data
+    df = pd.read_parquet(swebench_path)
+
+    skipped_count = 0
+
+    for idx, row in df.iterrows():
+        instance_id = row.get("instance_id", f"instance_{idx}")
+
+        # Build Docker image name
+        docker_image = build_image_name(instance_id, arch=arch)
+
+        # Check if image exists (if filtering enabled)
+        if skip_missing_images:
+            if not check_docker_image_exists(docker_image):
+                skipped_count += 1
+                continue
+
+        problem_statement = row.get("problem_statement", "")
+
+        # Create minimal prompt (runtime templates applied by SWE-Agent)
+        prompt = _make_minimal_prompt(problem_statement)
+
+        # Parse FAIL_TO_PASS and PASS_TO_PASS (stored as JSON strings)
+        fail_to_pass = row.get("FAIL_TO_PASS", "")
+        pass_to_pass = row.get("PASS_TO_PASS", "")
+
+        if isinstance(fail_to_pass, str):
+            try:
+                fail_to_pass = json.loads(fail_to_pass) if fail_to_pass else []
+            except json.JSONDecodeError:
+                fail_to_pass = []
+
+        if isinstance(pass_to_pass, str):
+            try:
+                pass_to_pass = json.loads(pass_to_pass) if pass_to_pass else []
+            except json.JSONDecodeError:
+                pass_to_pass = []
+
+        # Reward model config for SWE-bench evaluation
+        reward_model = {
+            "style": "swe_bench",
+            "instance_id": instance_id,
+            "test_patch": row.get("test_patch", ""),
+            "gold_patch": row.get("patch", ""),
+            "FAIL_TO_PASS": fail_to_pass,
+            "PASS_TO_PASS": pass_to_pass,
+        }
+
+        # Sandbox overrides for Docker image
+        sandbox_overrides = {
+            "docker_image": docker_image,
+        }
+
+        # Extra info
+        extra_info = {
+            "index": idx,
+            "split": split,
+            "instance_id": instance_id,
+            "repo": row.get("repo", ""),
+            "base_commit": row.get("base_commit", ""),
+            "version": row.get("version", ""),
+            "problem_statement": problem_statement,
+            "hints_text": row.get("hints_text", ""),
+            "created_at": row.get("created_at", ""),
+            "environment_setup_commit": row.get("environment_setup_commit", ""),
+            "difficulty": row.get("difficulty", ""),
+            "docker_image": docker_image,
+            "sandbox_overrides": sandbox_overrides,
+        }
+
+        rows.append(
+            {
+                "prompt": prompt,
+                "data_source": "swe_bench_verified",
+                "ability": "software_engineering",
+                "reward_model": reward_model,
+                "extra_info": extra_info,
+                "agent_name": agent_name,
+            }
+        )
+
+    if skip_missing_images and skipped_count > 0:
+        print(f"Skipped {skipped_count} instances with missing Docker images")
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -224,14 +343,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="SWE Agent Dataset Generator")
     parser.add_argument(
         "--mode",
-        choices=["simple", "swebench"],
+        choices=["simple", "swebench", "swebench_verified"],
         default="simple",
-        help="Data generation mode",
+        help="Data generation mode: 'simple' for test cases, 'swebench' for SWE-bench Lite, 'swebench_verified' for SWE-bench_Verified",
     )
     parser.add_argument("--train_size", type=int, default=100)
     parser.add_argument("--test_size", type=int, default=10)
     parser.add_argument("--swebench_train", type=str, default=None)
     parser.add_argument("--swebench_test", type=str, default=None)
+    parser.add_argument("--swebench_verified_train", type=str, default=None, help="Path to SWE-bench_Verified train parquet")
+    parser.add_argument("--swebench_verified_test", type=str, default=None, help="Path to SWE-bench_Verified test parquet")
+    parser.add_argument("--skip_missing_images", action="store_true", help="Skip instances with missing Docker images")
+    parser.add_argument("--docker_arch", default="x86_64", help="Docker image architecture")
     parser.add_argument("--output_dir", default="data/swe_agent")
     parser.add_argument("--agent_name", default="swe_agent")
     args = parser.parse_args()
@@ -251,12 +374,31 @@ def main() -> None:
         print("Generating simple test data...")
         train_df = generate_simple_test_data(args.train_size, "train", args.agent_name)
         test_df = generate_simple_test_data(args.test_size, "test", args.agent_name)
-    else:
+    elif args.mode == "swebench":
         print("Loading SWE-bench Lite data...")
         if args.swebench_train is None or args.swebench_test is None:
             raise ValueError("--swebench_train and --swebench_test are required for swebench mode")
         train_df = load_swebench_lite(args.swebench_train, "train", args.agent_name)
         test_df = load_swebench_lite(args.swebench_test, "test", args.agent_name)
+    elif args.mode == "swebench_verified":
+        # Load SWE-bench_Verified data
+        print("Loading SWE-bench_Verified data...")
+        if args.swebench_verified_train is None or args.swebench_verified_test is None:
+            raise ValueError("--swebench_verified_train and --swebench_verified_test are required for swebench_verified mode")
+        train_df = load_swebench_verified(
+            args.swebench_verified_train,
+            "train",
+            args.agent_name,
+            args.skip_missing_images,
+            args.docker_arch,
+        )
+        test_df = load_swebench_verified(
+            args.swebench_verified_test,
+            "test",
+            args.agent_name,
+            args.skip_missing_images,
+            args.docker_arch,
+        )
 
     train_path = os.path.join(args.output_dir, "train.parquet")
     test_path = os.path.join(args.output_dir, "test.parquet")
