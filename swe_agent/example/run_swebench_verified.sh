@@ -34,7 +34,8 @@ NNODES=${NNODES:-1}
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECIPE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VERL_ROOT="$(cd "$RECIPE_DIR/../.." && pwd)"
-export PYTHONPATH="$VERL_ROOT:${PYTHONPATH:-}"
+RECIPE_ROOT="$(cd "$VERL_ROOT/recipe" && pwd)"
+export PYTHONPATH="$RECIPE_ROOT:$VERL_ROOT:${PYTHONPATH:-}"
 
 mkdir -p $DATA_DIR $CHECKPOINT_DIR $LOG_DIR
 

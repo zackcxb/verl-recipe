@@ -58,7 +58,9 @@ Key parameters to customize in your training command:
 | Parameter | Description | Recommended Value |
 |-----------|-------------|-------------------|
 | `max_turns` | Maximum conversation turns | 50 |
-| `execution_timeout` | Timeout per instance (seconds) | 600 (10 min) |
+| `execution_timeout` | Timeout per tool command (seconds) | 600 (10 min) |
+| `install_timeout` | Timeout for tool installation phase (seconds) | 900 |
+| `max_parallel_tasks_per_worker` | Cross-process concurrent agent loops per node | 2-4 |
 | `train_batch_size` | Instances per batch | 8 |
 | `num_epochs` | PPO epochs per batch | 3 |
 | `learning_rate` | Actor learning rate | 1e-6 |
@@ -109,6 +111,8 @@ Current implementation uses patch similarity scoring:
 ```bash
 # In your training command:
 --agent.sandbox.execution_timeout=900  # 15 minutes
+--agent.sandbox.install_timeout=900    # tool install timeout
+--agent.sandbox.max_parallel_tasks_per_worker=2
 ```
 
 ### Full Dataset (No Filtering)
@@ -208,7 +212,7 @@ agent:
 
 **Ensure PYTHONPATH is set:**
 ```bash
-export PYTHONPATH=/home/cxb/verl:$PYTHONPATH
+export PYTHONPATH=/home/cxb/verl/recipe:/home/cxb/verl:$PYTHONPATH
 ```
 
 **Or run as module:**

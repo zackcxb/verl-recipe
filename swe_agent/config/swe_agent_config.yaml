@@ -50,6 +50,8 @@
     # --- Infrastructure fields (fixed per deployment) ---
     swe_agent_timeout: 1800 # SWE-Agent total execution time limit (seconds)
     execution_timeout: 300  # Per-tool execution timeout (seconds)
+    install_timeout: 900    # Tool install timeout (seconds)
+    max_parallel_tasks_per_worker: 2  # Cross-process concurrent SWE-Agent loops per node (0 = unlimited)
     output_dir: ./swe_agent_outputs    # Output directory (relative to cwd; override as needed)
     python_path: python3              # Python binary (set full path if not on PATH)
     # deployment_type: "docker" uses Docker isolation (default, recommended for production)

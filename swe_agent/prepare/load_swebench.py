@@ -100,6 +100,7 @@ def load_swebench_lite(
                 "ability": "software_engineering",
                 "reward_model": {
                     "style": "swe_bench",
+                    "ground_truth": item.get("patch", ""),
                     "instance_id": instance_id,
                     "test_patch": item.get("test_patch", ""),
                     "gold_patch": item.get("patch", ""),
@@ -195,6 +196,7 @@ def load_swebench_verified(
         # Reward model config for SWE-bench evaluation
         reward_model = {
             "style": "swe_bench",
+            "ground_truth": row.get("patch", ""),
             "instance_id": instance_id,
             "test_patch": row.get("test_patch", ""),
             "gold_patch": row.get("patch", ""),
