@@ -24,6 +24,7 @@ This is NOT the VERL runtime config — see ``runtime_config.py`` for that.
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional
 
 import yaml
@@ -130,6 +131,7 @@ class SWEAgentYAMLBuilder:
         # All parameters below come from SWEAgentRuntimeConfig.
         max_steps: int,
         execution_timeout: int,
+        install_timeout: int = 300,
         custom_templates: Optional[dict[str, str]] = None,
         custom_env_variables: Optional[dict[str, str]] = None,
         custom_registry_variables: Optional[dict[str, str]] = None,
@@ -144,6 +146,9 @@ class SWEAgentYAMLBuilder:
         docker_memory_limit: str = "8g",
         docker_startup_timeout: float = 180.0,
         docker_remove_container: bool = True,
+        repo_type: str = "local",
+        repo_base_commit: str = "HEAD",
+        preexisting_reset: bool = True,
     ):
         self.instance_id = instance_id
         self.repo_path = repo_path
@@ -151,6 +156,7 @@ class SWEAgentYAMLBuilder:
         self.model_proxy_port = model_proxy_port
         self.max_steps = max_steps
         self.execution_timeout = execution_timeout
+        self.install_timeout = install_timeout
         self.custom_templates = _to_native(custom_templates or {})
         self.custom_env_variables = _to_native(custom_env_variables or {})
         self.custom_registry_variables = _to_native(custom_registry_variables or {})
@@ -165,6 +171,9 @@ class SWEAgentYAMLBuilder:
         self.docker_memory_limit = docker_memory_limit
         self.docker_startup_timeout = docker_startup_timeout
         self.docker_remove_container = docker_remove_container
+        self.repo_type = repo_type
+        self.repo_base_commit = repo_base_commit
+        self.preexisting_reset = preexisting_reset
 
     def build(self) -> dict[str, Any]:
         """Build the SWE-Agent configuration dictionary."""
@@ -199,10 +208,35 @@ class SWEAgentYAMLBuilder:
                 "remove_container": self.docker_remove_container,
             }
 
+        if self.repo_type == "github":
+            github_url = self.repo_path
+            if github_url and not github_url.startswith("http://") and not github_url.startswith("https://"):
+                github_url = f"https://github.com/{github_url}"
+            repo_config: dict[str, Any] = {
+                "type": "github",
+                "github_url": github_url,
+                "base_commit": self.repo_base_commit,
+            }
+        elif self.repo_type == "preexisting":
+            repo_config = {
+                "type": "preexisting",
+                "repo_name": self.repo_path,
+                "base_commit": self.repo_base_commit,
+                "reset": self.preexisting_reset,
+            }
+        else:
+            repo_config = {
+                "path": self.repo_path,
+                "type": "local",
+                "base_commit": self.repo_base_commit,
+            }
+
+        api_base_host = os.getenv("SWE_AGENT_PROXY_HOST", "127.0.0.1")
+
         config = {
             "output_dir": self.output_dir,
             "env": {
-                "repo": {"path": self.repo_path, "type": "local"},
+                "repo": repo_config,
                 "deployment": deployment_config,
                 "name": f"verl-swe-{self.instance_id}",
             },
@@ -210,6 +244,7 @@ class SWEAgentYAMLBuilder:
                 "templates": templates,
                 "tools": {
                     "execution_timeout": self.execution_timeout,
+                    "install_timeout": self.install_timeout,
                     "env_variables": env_variables,
                     "bundles": tool_bundles,
                     "registry_variables": registry_variables,
@@ -226,7 +261,7 @@ class SWEAgentYAMLBuilder:
                     "temperature": 0.0,
                     "top_p": 1.0,
                     "max_input_tokens": self.max_input_tokens,
-                    "api_base": f"http://127.0.0.1:{self.model_proxy_port}/v1",
+                    "api_base": f"http://{api_base_host}:{self.model_proxy_port}/v1",
                     "api_key": "verl-swe-agent-key",
                 },
             },

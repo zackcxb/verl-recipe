@@ -33,6 +33,7 @@ def test_yaml_builder_creates_valid_config():
     assert config["agent"]["model"]["api_base"] == "http://127.0.0.1:8080/v1"
     assert config["agent"]["model"]["per_instance_call_limit"] == 50
     assert config["agent"]["tools"]["execution_timeout"] == 300
+    assert config["agent"]["tools"]["install_timeout"] == 300
 
 
 def test_yaml_builder_to_yaml_string():
@@ -68,3 +69,59 @@ def test_yaml_builder_custom_templates():
 
     config = builder.build()
     assert config["agent"]["templates"]["system_template"] == "Custom system prompt"
+
+
+def test_yaml_builder_local_deployment_uses_loopback_api_base():
+    """Local deployment should access local proxy via loopback."""
+    builder = SWEAgentYAMLBuilder(
+        instance_id="test-local",
+        repo_path="/workspace/repo",
+        output_dir="/tmp/output",
+        model_proxy_port=8080,
+        max_steps=50,
+        execution_timeout=300,
+        deployment_type="local",
+    )
+
+    config = builder.build()
+
+    assert config["agent"]["model"]["api_base"] == "http://127.0.0.1:8080/v1"
+
+
+def test_yaml_builder_preexisting_repo_reset_flag():
+    """Preexisting repo config should include reset flag when requested."""
+    builder = SWEAgentYAMLBuilder(
+        instance_id="test-preexisting",
+        repo_path="testbed",
+        output_dir="/tmp/output",
+        model_proxy_port=8080,
+        max_steps=50,
+        execution_timeout=300,
+        repo_type="preexisting",
+        repo_base_commit="abc123",
+        preexisting_reset=False,
+    )
+
+    config = builder.build()
+
+    assert config["env"]["repo"]["type"] == "preexisting"
+    assert config["env"]["repo"]["repo_name"] == "testbed"
+    assert config["env"]["repo"]["base_commit"] == "abc123"
+    assert config["env"]["repo"]["reset"] is False
+
+
+def test_yaml_builder_custom_install_timeout():
+    """Custom install timeout should be written to tools config."""
+    builder = SWEAgentYAMLBuilder(
+        instance_id="test-install-timeout",
+        repo_path="/workspace/repo",
+        output_dir="/tmp/output",
+        model_proxy_port=8080,
+        max_steps=50,
+        execution_timeout=300,
+        install_timeout=900,
+    )
+
+    config = builder.build()
+
+    assert config["agent"]["tools"]["install_timeout"] == 900

@@ -53,8 +53,9 @@ class SWEAgentRuntimeConfig:
 
     Infrastructure (fixed per deployment):
       proxy_port, max_port_retries, proxy_timeout, swe_agent_timeout,
-      execution_timeout, output_dir, python_path, deployment_type,
-      docker_memory_limit, docker_startup_timeout, docker_remove_container
+      execution_timeout, install_timeout, max_parallel_tasks_per_worker,
+      output_dir, python_path, deployment_type, docker_memory_limit,
+      docker_startup_timeout, docker_remove_container
 
     Data-affine (may vary per task/dataset instance):
       max_steps, max_turns, docker_image, templates, tool_bundles,
@@ -69,6 +70,8 @@ class SWEAgentRuntimeConfig:
     # --- Sandbox (infrastructure) ---
     swe_agent_timeout: int = 1800
     execution_timeout: int = 300
+    install_timeout: int = 300
+    max_parallel_tasks_per_worker: int = 0
     output_dir: str = ""
     python_path: str = "python3"
     deployment_type: str = "docker"
@@ -154,6 +157,8 @@ def build_runtime_config(
         # Sandbox — infrastructure
         swe_agent_timeout=int(sandbox.get("swe_agent_timeout", 1800)),
         execution_timeout=int(sandbox.get("execution_timeout", 300)),
+        install_timeout=int(sandbox.get("install_timeout", 300)),
+        max_parallel_tasks_per_worker=int(sandbox.get("max_parallel_tasks_per_worker", 0)),
         output_dir=output_dir,
         python_path=str(sandbox.get("python_path", "python3")),
         deployment_type=str(sandbox.get("deployment_type", "docker")),
@@ -231,6 +236,8 @@ def apply_data_overrides(
         "docker_image",
         "swe_agent_timeout",
         "execution_timeout",
+        "install_timeout",
+        "max_parallel_tasks_per_worker",
         "deployment_type",
         "docker_memory_limit",
         "docker_startup_timeout",
@@ -239,8 +246,16 @@ def apply_data_overrides(
     for k, v in sandbox_overrides.items():
         if k in _SANDBOX_FIELDS and hasattr(cfg, k):
             old = getattr(cfg, k)
-            setattr(cfg, k, type(old)(v) if old is not None else v)
-            logger.debug(f"Data override: {k}={v} (was {old})")
+            if v is None:
+                logger.debug(f"Data override skipped: {k}=None (keep {old})")
+                continue
+            try:
+                casted = type(old)(v) if old is not None else v
+            except (TypeError, ValueError):
+                logger.debug(f"Data override fallback: {k}={v} (was {old})")
+                casted = v
+            setattr(cfg, k, casted)
+            logger.debug(f"Data override: {k}={casted} (was {old})")
 
     # Agent overrides: templates, tools config
     if agent_overrides.get("templates"):
