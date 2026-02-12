@@ -85,6 +85,9 @@ _DEFAULT_TEMPLATES: dict[str, Any] = {
         "Steps:\n"
         "1. Explore the repo with `ls` and `cat` to understand the code\n"
         "2. Make the required changes using `str_replace_editor` or bash commands\n"
+        "   - `str_replace_editor` requires positional args: <command> <path> (no --path flag)\n"
+        "   - Example: str_replace_editor str_replace /testbed/file.py --old_str \"<exact old>\" --new_str \"<new>\"\n"
+        "   - Quote arguments carefully when strings contain spaces or newlines\n"
         "3. Verify your changes work\n"
         "4. Run `submit` to submit your patch\n\n"
         "You MUST run `submit` when you are done to generate the final patch."
@@ -123,6 +126,12 @@ def _validate_sandbox_config(sandbox_config: dict[str, Any]) -> None:
     max_steps = sandbox_config.get("max_steps")
     if max_steps is not None and (not isinstance(max_steps, int) or max_steps <= 0):
         raise ConfigValidationError(f"sandbox_config.max_steps must be a positive integer, got: {max_steps}")
+    max_parallel_tasks = sandbox_config.get("max_parallel_tasks_per_worker")
+    if max_parallel_tasks is not None and (not isinstance(max_parallel_tasks, int) or max_parallel_tasks < 0):
+        raise ConfigValidationError(
+            "sandbox_config.max_parallel_tasks_per_worker must be a non-negative integer, "
+            f"got: {max_parallel_tasks}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +225,7 @@ class SWEAgentRuntimeConfig:
 
     Infrastructure (fixed per deployment):
       proxy_port, max_port_retries, proxy_timeout, swe_agent_timeout,
-      execution_timeout, output_dir,
+      execution_timeout, max_parallel_tasks_per_worker, output_dir,
       docker_memory_limit, docker_startup_timeout, docker_remove_container
 
     Data-affine (may vary per task/dataset instance):
@@ -232,6 +241,7 @@ class SWEAgentRuntimeConfig:
     # --- Sandbox (infrastructure) ---
     swe_agent_timeout: int = 1800
     execution_timeout: int = 300
+    max_parallel_tasks_per_worker: int = 0
     output_dir: str = ""
     docker_memory_limit: str = "8g"
     docker_startup_timeout: float = 180.0
@@ -297,6 +307,7 @@ def build_runtime_config(yaml_kwargs: dict[str, Any]) -> SWEAgentRuntimeConfig:
         # Sandbox — infrastructure
         swe_agent_timeout=int(yaml_sandbox.get("swe_agent_timeout", 1800)),
         execution_timeout=int(yaml_sandbox.get("execution_timeout", 300)),
+        max_parallel_tasks_per_worker=int(yaml_sandbox.get("max_parallel_tasks_per_worker", 0)),
         output_dir=output_dir,
         docker_memory_limit=str(yaml_sandbox.get("docker_memory_limit", "8g")),
         docker_startup_timeout=float(yaml_sandbox.get("docker_startup_timeout", 180.0)),
@@ -367,6 +378,7 @@ def apply_data_overrides(
         "docker_image",
         "swe_agent_timeout",
         "execution_timeout",
+        "max_parallel_tasks_per_worker",
         "docker_memory_limit",
         "docker_startup_timeout",
         "docker_remove_container",
@@ -418,6 +430,9 @@ class SWEAgentYAMLBuilder:
         model_proxy_port: int,
         cfg: SWEAgentRuntimeConfig,
         max_input_tokens: int = 0,
+        repo_type: str = "local",
+        repo_base_commit: str = "HEAD",
+        preexisting_repo_reset: bool = True,
     ):
         self._id = instance_id
         self._repo = repo_path
@@ -425,6 +440,9 @@ class SWEAgentYAMLBuilder:
         self._port = model_proxy_port
         self._cfg = cfg
         self._max_input_tokens = max_input_tokens
+        self._repo_type = repo_type
+        self._repo_base_commit = repo_base_commit
+        self._preexisting_repo_reset = preexisting_repo_reset
 
     @classmethod
     def from_config(
@@ -436,6 +454,9 @@ class SWEAgentYAMLBuilder:
         output_dir: str,
         model_proxy_port: int,
         max_input_tokens: int = 0,
+        repo_type: str = "local",
+        repo_base_commit: str = "HEAD",
+        preexisting_repo_reset: bool = True,
     ) -> SWEAgentYAMLBuilder:
         """Construct a builder from a runtime config."""
         return cls(
@@ -445,6 +466,9 @@ class SWEAgentYAMLBuilder:
             model_proxy_port=model_proxy_port,
             cfg=cfg,
             max_input_tokens=max_input_tokens,
+            repo_type=repo_type,
+            repo_base_commit=repo_base_commit,
+            preexisting_repo_reset=preexisting_repo_reset,
         )
 
     def build(self) -> dict[str, Any]:
@@ -466,10 +490,33 @@ class SWEAgentYAMLBuilder:
         registry_variables = {**_DEFAULT_REGISTRY_VARIABLES, **cfg.tool_registry_variables}
         tool_bundles = cfg.tool_bundles if cfg.tool_bundles is not None else _DEFAULT_TOOL_BUNDLES
 
+        if self._repo_type == "preexisting":
+            repo_config: dict[str, Any] = {
+                "type": "preexisting",
+                "repo_name": self._repo,
+                "base_commit": self._repo_base_commit,
+                "reset": self._preexisting_repo_reset,
+            }
+        elif self._repo_type == "github":
+            github_url = self._repo
+            if github_url and not github_url.startswith("http://") and not github_url.startswith("https://"):
+                github_url = f"https://github.com/{github_url}"
+            repo_config = {
+                "type": "github",
+                "github_url": github_url,
+                "base_commit": self._repo_base_commit,
+            }
+        else:
+            repo_config = {
+                "path": self._repo,
+                "type": "local",
+                "base_commit": self._repo_base_commit,
+            }
+
         config = {
             "output_dir": self._out,
             "env": {
-                "repo": {"path": self._repo, "type": "local"},
+                "repo": repo_config,
                 "deployment": {
                     "type": "docker",
                     "image": cfg.docker_image,

@@ -45,6 +45,7 @@ async def execute_swe_agent(
     exec_dir: str,
     swe_agent_timeout: int = 1800,
     proxy_port: int = 8080,
+    problem_statement_id: Optional[str] = None,
 ) -> Optional[str]:
     """Execute SWE-Agent CLI and return the generated patch.
 
@@ -58,10 +59,13 @@ async def execute_swe_agent(
                   (avoids YAML parsing issues with ``docker`` subdir).
         swe_agent_timeout: Overall timeout in seconds.
         proxy_port: ModelProxy port (for logging only).
+        problem_statement_id: Optional task id passed to SWE-Agent. Defaults to instance_id.
 
     Returns:
         Generated patch string, or ``None`` on failure.
     """
+    effective_problem_id = problem_statement_id or instance_id
+
     cmd = [
         "sweagent",
         "run",
@@ -70,7 +74,7 @@ async def execute_swe_agent(
         "--problem_statement.text",
         problem_statement,
         "--problem_statement.id",
-        instance_id,
+        effective_problem_id,
     ]
 
     logger.info(f"[{instance_id}] Executing SWE-Agent (proxy port={proxy_port})...")

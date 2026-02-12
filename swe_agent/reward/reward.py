@@ -157,7 +157,7 @@ def compute_score(
     Returns:
         Reward score as float.
     """
-    if data_source in ("swe_agent_simple", "swe_agent", "swe_bench", "swe_bench_lite"):
+    if data_source in ("swe_agent_simple", "swe_agent", "swe_bench", "swe_bench_lite", "swe_bench_verified"):
         # Extract the actual patch from extra_info
         generated_patch = None
         if extra_info is not None:

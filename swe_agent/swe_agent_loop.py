@@ -29,6 +29,8 @@ Delegated responsibilities:
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -93,13 +95,56 @@ class SWEAgentLoop(AgentLoopBase):
         # ── Build structured runtime config (YAML baseline) ──
         self.runtime_config: SWEAgentRuntimeConfig = build_runtime_config(yaml_kwargs=kwargs)
 
-        # ── ModelProxy ──
-        self.model_proxy = ModelProxy(port=self.runtime_config.proxy_port)
         logger.info(
             f"SWE Agent Loop initialised "
             f"(max_turns={self.runtime_config.max_turns}, "
-            f"max_steps={self.runtime_config.max_steps})"
+            f"max_steps={self.runtime_config.max_steps}, "
+            f"max_parallel_tasks_per_worker={self.runtime_config.max_parallel_tasks_per_worker})"
         )
+
+    @classmethod
+    def _slot_lock_dir(cls, output_dir: str) -> str:
+        """Return lock directory for cross-process run-slot coordination."""
+        digest = hashlib.sha1(os.path.abspath(output_dir).encode("utf-8")).hexdigest()[:12]
+        return os.path.join(tempfile.gettempdir(), f"verl_swe_agent_slots_{digest}")
+
+    @classmethod
+    async def _acquire_run_slot(
+        cls,
+        max_parallel_tasks_per_worker: int,
+        output_dir: str,
+    ) -> Optional[tuple[int, int]]:
+        """Acquire one cross-process run slot."""
+        if max_parallel_tasks_per_worker <= 0:
+            return None
+
+        lock_dir = cls._slot_lock_dir(output_dir)
+        os.makedirs(lock_dir, exist_ok=True)
+
+        while True:
+            for slot_idx in range(max_parallel_tasks_per_worker):
+                lock_path = os.path.join(lock_dir, f"slot_{slot_idx}.lock")
+                fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0), 0o666)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    os.ftruncate(fd, 0)
+                    os.write(fd, f"pid={os.getpid()}\n".encode("utf-8"))
+                    return fd, slot_idx
+                except BlockingIOError:
+                    os.close(fd)
+
+            await asyncio.sleep(0.2)
+
+    @staticmethod
+    def _release_run_slot(run_slot: Optional[tuple[int, int]]) -> None:
+        """Release a previously acquired run slot."""
+        if run_slot is None:
+            return
+        fd, _ = run_slot
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     # ------------------------------------------------------------------
     # Main loop
@@ -109,6 +154,8 @@ class SWEAgentLoop(AgentLoopBase):
         """Run one SWE-Agent episode and return the trajectory."""
         run_start_time = time.time()
         agent_task: Optional[asyncio.Task] = None
+        model_proxy: Optional[ModelProxy] = None
+        run_slot: Optional[tuple[int, int]] = None
 
         # ── 1. Parse input ──
         extra_info = kwargs.get("extra_info", {})
@@ -123,6 +170,15 @@ class SWEAgentLoop(AgentLoopBase):
         repo_content = extra_info.get("repo_content", None)
         if repo_content is None:
             repo_content = kwargs.get("repo_content", None)
+        repo_name = extra_info.get("repo", "")
+        base_commit = extra_info.get("base_commit", "HEAD")
+        problem_instance_id = str(extra_info.get("instance_id", "") or "")
+        sandbox_overrides = extra_info.get("sandbox_overrides", {}) or {}
+        if isinstance(sandbox_overrides, str):
+            try:
+                sandbox_overrides = json.loads(sandbox_overrides)
+            except json.JSONDecodeError:
+                sandbox_overrides = {}
 
         # ── 2. Per-instance config (data-affine overrides) ──
         run_cfg = apply_data_overrides(self.runtime_config, extra_info)
@@ -134,17 +190,61 @@ class SWEAgentLoop(AgentLoopBase):
             repo_path = temp_repo_dir
             logger.info(f"Created temporary repo at: {repo_path}")
         elif not repo_path:
-            repo_path = "/workspace/repo"
+            repo_path = "" if repo_name else "/workspace/repo"
+
+        use_preexisting_repo_override = sandbox_overrides.get("use_preexisting_repo", None)
+        if use_preexisting_repo_override is None:
+            use_preexisting_repo = bool(repo_name) and not bool(repo_path) and run_cfg.docker_image.startswith("sweb.eval.")
+        else:
+            use_preexisting_repo = bool(use_preexisting_repo_override)
+
+        preexisting_repo_name = str(sandbox_overrides.get("preexisting_repo_name", "testbed") or "testbed")
+        preexisting_repo_reset = bool(sandbox_overrides.get("preexisting_repo_reset", False))
+
+        if use_preexisting_repo:
+            logger.info(
+                "Using preexisting repo in container: "
+                f"repo_name={preexisting_repo_name}, reset={preexisting_repo_reset}"
+            )
 
         logger.info(f"Starting SWE Agent Loop for problem: {problem_statement[:100]}...")
 
-        # ── 4. Start ModelProxy ──
-        await self.model_proxy.start_server(max_retries=run_cfg.max_port_retries)
-        logger.info(f"ModelProxy started on port {self.model_proxy.port}")
-
         try:
+            if run_cfg.max_parallel_tasks_per_worker > 0:
+                logger.info(
+                    "Waiting for SWE-agent run slot "
+                    f"(max_parallel_tasks_per_worker={run_cfg.max_parallel_tasks_per_worker})"
+                )
+                run_slot = await self._acquire_run_slot(
+                    run_cfg.max_parallel_tasks_per_worker,
+                    run_cfg.output_dir,
+                )
+                logger.info(
+                    "Acquired SWE-agent run slot "
+                    f"(slot={run_slot[1]}, max_parallel_tasks_per_worker={run_cfg.max_parallel_tasks_per_worker})"
+                )
+
+            model_proxy = ModelProxy(port=run_cfg.proxy_port)
+
+            # ── 4. Start ModelProxy ──
+            await model_proxy.start_server(max_retries=run_cfg.max_port_retries)
+            logger.info(f"ModelProxy started on port {model_proxy.port}")
+
             # ── 5. Launch SWE-Agent subprocess ──
-            agent_task = asyncio.create_task(self._launch_agent(problem_statement, repo_path, run_cfg))
+            agent_task = asyncio.create_task(
+                self._launch_agent(
+                    problem_statement,
+                    repo_path,
+                    run_cfg,
+                    model_proxy_port=model_proxy.port,
+                    repo_base_commit=base_commit,
+                    use_preexisting_repo=use_preexisting_repo,
+                    preexisting_repo_name=preexisting_repo_name,
+                    preexisting_repo_reset=preexisting_repo_reset,
+                    problem_statement_id=problem_instance_id,
+                    repo_name=repo_name,
+                )
+            )
 
             # ── 6. Interaction loop ──
             (
@@ -159,6 +259,7 @@ class SWEAgentLoop(AgentLoopBase):
                 sampling_params=sampling_params,
                 max_turns=run_cfg.max_turns,
                 request_timeout=run_cfg.proxy_timeout,
+                model_proxy=model_proxy,
             )
 
             # ── 7. Drain agent task ──
@@ -191,8 +292,12 @@ class SWEAgentLoop(AgentLoopBase):
                     await asyncio.wait_for(agent_task, timeout=10.0)
                 except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                     pass
-            await self.model_proxy.stop_server()
+            if model_proxy is not None:
+                await model_proxy.stop_server()
             cleanup_temp_repo(temp_repo_dir)
+            if run_slot is not None:
+                self._release_run_slot(run_slot)
+                logger.info(f"Released SWE-agent run slot (slot={run_slot[1]})")
 
     # ------------------------------------------------------------------
     # Interaction loop (extracted for readability)
@@ -204,6 +309,7 @@ class SWEAgentLoop(AgentLoopBase):
         sampling_params: dict[str, Any],
         max_turns: int,
         request_timeout: float,
+        model_proxy: ModelProxy,
     ) -> tuple[
         Optional[str],  # patch
         int,  # num_turns
@@ -231,7 +337,7 @@ class SWEAgentLoop(AgentLoopBase):
                 break
 
             # Race: model request vs. agent completion
-            request_task = asyncio.create_task(self.model_proxy.get_request())
+            request_task = asyncio.create_task(model_proxy.get_request())
             done, pending = await asyncio.wait(
                 {request_task, agent_task},
                 timeout=request_timeout,
@@ -311,7 +417,7 @@ class SWEAgentLoop(AgentLoopBase):
             prev_messages = messages
 
             # Send response back
-            await self.model_proxy.send_response(response_text, request=model_request)
+            await model_proxy.send_response(response_text, request=model_request)
 
             logger.info(f"Turn {num_turns}: {len(response_ids)} model tokens, total_seq={len(all_response_ids)}")
 
@@ -330,6 +436,14 @@ class SWEAgentLoop(AgentLoopBase):
         problem_statement: str,
         repo_path: str,
         cfg: SWEAgentRuntimeConfig,
+        *,
+        model_proxy_port: int,
+        repo_base_commit: str = "HEAD",
+        use_preexisting_repo: bool = False,
+        preexisting_repo_name: str = "testbed",
+        preexisting_repo_reset: bool = False,
+        problem_statement_id: str = "",
+        repo_name: str = "",
     ) -> Optional[str]:
         """Generate config, run SWE-Agent subprocess, cleanup."""
         instance_id = f"{uuid.uuid4().hex[:12]}-{int(time.time())}"
@@ -338,7 +452,18 @@ class SWEAgentLoop(AgentLoopBase):
         exec_dir = tempfile.mkdtemp(prefix=f"swe_exec_{instance_id}_")
 
         # Generate YAML config for SWE-Agent CLI
-        config_path = self._write_agent_yaml(instance_id, repo_path, instance_output_dir, cfg)
+        config_path = self._write_agent_yaml(
+            instance_id,
+            repo_path,
+            instance_output_dir,
+            cfg,
+            model_proxy_port=model_proxy_port,
+            repo_base_commit=repo_base_commit,
+            use_preexisting_repo=use_preexisting_repo,
+            preexisting_repo_name=preexisting_repo_name,
+            preexisting_repo_reset=preexisting_repo_reset,
+            repo_name=repo_name,
+        )
 
         try:
             patch = await execute_swe_agent(
@@ -349,7 +474,8 @@ class SWEAgentLoop(AgentLoopBase):
                 repo_path=repo_path,
                 exec_dir=exec_dir,
                 swe_agent_timeout=cfg.swe_agent_timeout,
-                proxy_port=self.model_proxy.port,
+                proxy_port=model_proxy_port,
+                problem_statement_id=problem_statement_id,
             )
             return patch
         except Exception as e:
@@ -369,16 +495,36 @@ class SWEAgentLoop(AgentLoopBase):
         repo_path: str,
         output_dir: str,
         cfg: SWEAgentRuntimeConfig,
+        *,
+        model_proxy_port: int,
+        repo_base_commit: str = "HEAD",
+        use_preexisting_repo: bool = False,
+        preexisting_repo_name: str = "testbed",
+        preexisting_repo_reset: bool = False,
+        repo_name: str = "",
     ) -> str:
         """Build and write SWE-Agent CLI YAML, return file path."""
         max_input_tokens = int(getattr(self.config.actor_rollout_ref.rollout, "max_model_len", 0) or 0)
+        if use_preexisting_repo:
+            yaml_repo_path = preexisting_repo_name
+            yaml_repo_type = "preexisting"
+        elif repo_name and not repo_path:
+            yaml_repo_path = repo_name
+            yaml_repo_type = "github"
+        else:
+            yaml_repo_path = repo_path
+            yaml_repo_type = "local"
+
         builder = SWEAgentYAMLBuilder.from_config(
             cfg,
             instance_id=instance_id,
-            repo_path=repo_path,
+            repo_path=yaml_repo_path,
             output_dir=output_dir,
-            model_proxy_port=self.model_proxy.port,
+            model_proxy_port=model_proxy_port,
             max_input_tokens=max_input_tokens,
+            repo_type=yaml_repo_type,
+            repo_base_commit=repo_base_commit,
+            preexisting_repo_reset=preexisting_repo_reset,
         )
         f = tempfile.NamedTemporaryFile(
             mode="w",
