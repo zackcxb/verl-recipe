@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 class DeepEyesGatewayDataset(RLHFDataset):
     """Thin dataset that leaves prompt encoding and vision extraction to the gateway."""
 
+    def _build_messages(self, example: dict, key: str):
+        """Return stored messages unchanged because gateway owns placeholder and vision handling in phase 1."""
+        return example[key]
+
     def maybe_filter_out_long_prompts(self, dataframe=None):
         """Skip base prompt filtering because phase 1 must not tokenize or preprocess vision here."""
         return self.dataframe if dataframe is None else dataframe
