@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
 import time
 from typing import Any
 
@@ -16,6 +17,7 @@ MISSING = object()
 AgentLoopManager = None
 GatewayServingRuntime = None
 OpenAICompatibleAgentFramework = None
+get_custom_reward_fn = None
 hf_processor = None
 hf_tokenizer = None
 stub_agent_runner = None
@@ -99,6 +101,15 @@ def _get_hf_processor_helper():
     return hf_processor
 
 
+def _get_custom_reward_fn_loader():
+    global get_custom_reward_fn
+    if get_custom_reward_fn is None:
+        from verl.trainer.ppo.reward import get_custom_reward_fn as custom_reward_fn_loader
+
+        get_custom_reward_fn = custom_reward_fn_loader
+    return get_custom_reward_fn
+
+
 def _load_tokenizer_and_processor(model_path: str, *, trust_remote_code: bool):
     tokenizer = _get_hf_tokenizer_helper()(model_path, trust_remote_code=trust_remote_code)
     processor = _get_hf_processor_helper()(model_path, trust_remote_code=trust_remote_code)
@@ -124,6 +135,36 @@ def _apply_custom_chat_template(tokenizer, processor, custom_chat_template) -> N
 
 def _zero_reward_fn(ctx):
     return [0.0 for _ in ctx.trajectories]
+
+
+def _extract_ground_truth(sample_fields: dict[str, Any]):
+    reward_model = sample_fields.get("reward_model")
+    if isinstance(reward_model, dict):
+        return reward_model.get("ground_truth")
+    if reward_model is None:
+        return None
+    return getattr(reward_model, "ground_truth", None)
+
+
+def _build_framework_reward_fn(*, config: Any, tokenizer):
+    custom_reward_fn = _get_custom_reward_fn_loader()(config)
+    if custom_reward_fn is None:
+        return _zero_reward_fn
+
+    async def reward_fn(ctx):
+        data_source = ctx.sample_fields.get("data_source")
+        ground_truth = _extract_ground_truth(ctx.sample_fields)
+        extra_info = ctx.sample_fields.get("extra_info")
+        scores = []
+        for trajectory in ctx.trajectories:
+            response_text = tokenizer.decode(trajectory.response_ids, skip_special_tokens=True)
+            score = custom_reward_fn(data_source, response_text, ground_truth, extra_info)
+            if inspect.isawaitable(score):
+                score = await score
+            scores.append(score)
+        return scores
+
+    return reward_fn
 
 
 class AgentFrameworkRolloutAdapter:
@@ -198,8 +239,9 @@ class AgentFrameworkRolloutAdapter:
             tokenizer=tokenizer,
             processor=processor,
             agent_runner=agent_runner,
-            reward_fn=_zero_reward_fn,
+            reward_fn=_build_framework_reward_fn(config=config, tokenizer=tokenizer),
             gateway_count=gateway_count,
+            host=None,
         )
         instance._rollout_replicas = manager.rollout_replicas
         return instance
@@ -215,6 +257,7 @@ class AgentFrameworkRolloutAdapter:
         agent_runner=None,
         reward_fn=None,
         gateway_count: int = 1,
+        host: str | None = "127.0.0.1",
     ) -> "AgentFrameworkRolloutAdapter":
         """Create an adapter wired to a stub-backed GatewayServingRuntime for tests."""
         instance = cls()
@@ -222,15 +265,16 @@ class AgentFrameworkRolloutAdapter:
         instance._server_handles = [handle for _, handle in servers]
         instance._load_balancer = load_balancer_handle
 
+        gateway_actor_kwargs = {
+            "tokenizer": tokenizer,
+            "processor": processor,
+            "host": host,
+        }
         runtime = _get_gateway_runtime_class()(
             servers=servers,
             load_balancer_handle=load_balancer_handle,
             gateway_count=gateway_count,
-            gateway_actor_kwargs={
-                "tokenizer": tokenizer,
-                "processor": processor,
-                "host": "127.0.0.1",
-            },
+            gateway_actor_kwargs=gateway_actor_kwargs,
         )
         instance._runtime = runtime
 
