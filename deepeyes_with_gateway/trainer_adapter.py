@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import time
 from typing import Any
@@ -13,10 +14,10 @@ BACKFILL_NON_TENSOR_KEYS = ("data_source", "reward_model", "extra_info", "uid")
 MISSING = object()
 
 AgentLoopManager = None
-AutoProcessor = None
-AutoTokenizer = None
 GatewayServingRuntime = None
 OpenAICompatibleAgentFramework = None
+hf_processor = None
+hf_tokenizer = None
 stub_agent_runner = None
 
 
@@ -80,31 +81,27 @@ def _get_stub_agent_runner():
     return stub_agent_runner
 
 
-def _get_auto_tokenizer_class():
-    global AutoTokenizer
-    if AutoTokenizer is None:
-        from transformers import AutoTokenizer as auto_tokenizer_class
+def _get_hf_tokenizer_helper():
+    global hf_tokenizer
+    if hf_tokenizer is None:
+        from verl.utils.tokenizer import hf_tokenizer as hf_tokenizer_helper
 
-        AutoTokenizer = auto_tokenizer_class
-    return AutoTokenizer
+        hf_tokenizer = hf_tokenizer_helper
+    return hf_tokenizer
 
 
-def _get_auto_processor_class():
-    global AutoProcessor
-    if AutoProcessor is None:
-        from transformers import AutoProcessor as auto_processor_class
+def _get_hf_processor_helper():
+    global hf_processor
+    if hf_processor is None:
+        from verl.utils.tokenizer import hf_processor as hf_processor_helper
 
-        AutoProcessor = auto_processor_class
-    return AutoProcessor
+        hf_processor = hf_processor_helper
+    return hf_processor
 
 
 def _load_tokenizer_and_processor(model_path: str):
-    tokenizer = _get_auto_tokenizer_class().from_pretrained(model_path, trust_remote_code=True)
-    processor = None
-    try:
-        processor = _get_auto_processor_class().from_pretrained(model_path, trust_remote_code=True)
-    except Exception:
-        processor = None
+    tokenizer = _get_hf_tokenizer_helper()(model_path, trust_remote_code=True)
+    processor = _get_hf_processor_helper()(model_path, trust_remote_code=True)
     return tokenizer, processor
 
 
@@ -113,10 +110,7 @@ def _apply_custom_chat_template(tokenizer, processor, custom_chat_template) -> N
         return
     tokenizer.chat_template = custom_chat_template
     if processor is not None:
-        try:
-            processor.chat_template = custom_chat_template
-        except Exception:
-            pass
+        processor.chat_template = custom_chat_template
 
 
 def _zero_reward_fn(ctx):
@@ -278,13 +272,12 @@ class AgentFrameworkRolloutAdapter:
 
     @auto_await
     async def start_profile(self, **kwargs):
-        del kwargs
-        return None
+        await asyncio.gather(*[replica.start_profile(**kwargs) for replica in self.rollout_replicas])
 
     @auto_await
     async def stop_profile(self):
-        return None
+        await asyncio.gather(*[replica.stop_profile() for replica in self.rollout_replicas])
 
     @auto_await
     async def clear_kv_cache(self):
-        return None
+        await asyncio.gather(*[replica.clear_kv_cache() for replica in self.rollout_replicas])
