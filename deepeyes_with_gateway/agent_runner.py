@@ -20,10 +20,11 @@ async def stub_agent_runner(
 ) -> None:
     """Send a single chat completion request for phase-1 validation."""
     del sample_index, kwargs
+    messages = list(raw_prompt)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(
             f"{session.base_url}/chat/completions",
-            json={"model": "stub", "messages": raw_prompt},
+            json={"model": "stub", "messages": messages},
         )
         response.raise_for_status()
