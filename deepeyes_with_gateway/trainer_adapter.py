@@ -99,10 +99,19 @@ def _get_hf_processor_helper():
     return hf_processor
 
 
-def _load_tokenizer_and_processor(model_path: str):
-    tokenizer = _get_hf_tokenizer_helper()(model_path, trust_remote_code=True)
-    processor = _get_hf_processor_helper()(model_path, trust_remote_code=True)
+def _load_tokenizer_and_processor(model_path: str, *, trust_remote_code: bool):
+    tokenizer = _get_hf_tokenizer_helper()(model_path, trust_remote_code=trust_remote_code)
+    processor = _get_hf_processor_helper()(model_path, trust_remote_code=trust_remote_code)
     return tokenizer, processor
+
+
+def _get_trust_remote_code(config: Any) -> bool:
+    trust_remote_code = _get_config_value(config, "actor_rollout_ref.model.trust_remote_code", default=MISSING)
+    if trust_remote_code is MISSING:
+        trust_remote_code = _get_config_value(config, "data.trust_remote_code", default=MISSING)
+    if trust_remote_code is MISSING:
+        return True
+    return bool(trust_remote_code)
 
 
 def _apply_custom_chat_template(tokenizer, processor, custom_chat_template) -> None:
@@ -137,7 +146,9 @@ class AgentFrameworkRolloutAdapter:
         rollout_resource_pool=None,
         reward_loop_worker_handles=None,
         teacher_model_manager=None,
+        replay_buffer=None,
     ) -> "AgentFrameworkRolloutAdapter":
+        del replay_buffer
         manager = _get_agent_loop_manager_class()(
             config=config,
             worker_group=worker_group,
@@ -161,7 +172,10 @@ class AgentFrameworkRolloutAdapter:
         if model_path is None:
             raise ValueError("config.actor_rollout_ref.model.path is required for AgentFrameworkRolloutAdapter.create()")
 
-        tokenizer, processor = _load_tokenizer_and_processor(model_path)
+        tokenizer, processor = _load_tokenizer_and_processor(
+            model_path,
+            trust_remote_code=_get_trust_remote_code(config),
+        )
         _apply_custom_chat_template(
             tokenizer=tokenizer,
             processor=processor,
