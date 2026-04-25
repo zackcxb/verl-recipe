@@ -16,6 +16,7 @@ class AgentFrameworkRolloutAdapter:
 
     def __init__(self) -> None:
         self._framework = None
+        self._runtime = None
         self._rollout_replicas = []
         self._server_handles = []
         self._server_addresses = []
@@ -37,6 +38,55 @@ class AgentFrameworkRolloutAdapter:
         del reward_loop_worker_handles
         del teacher_model_manager
         return cls()
+
+    @classmethod
+    def create_from_stub(
+        cls,
+        *,
+        servers: list[tuple[str, Any]],
+        load_balancer_handle,
+        tokenizer,
+        processor=None,
+        agent_runner=None,
+        reward_fn=None,
+        gateway_count: int = 1,
+    ) -> "AgentFrameworkRolloutAdapter":
+        """Create an adapter wired to a stub-backed GatewayServingRuntime for tests."""
+        from recipe.deepeyes_with_gateway.agent_runner import stub_agent_runner
+        from verl.agent.framework.framework import OpenAICompatibleAgentFramework
+        from verl.agent.gateway.runtime import GatewayServingRuntime
+
+        instance = cls()
+        instance._server_addresses = [server_id for server_id, _ in servers]
+        instance._server_handles = [handle for _, handle in servers]
+        instance._load_balancer = load_balancer_handle
+
+        runtime = GatewayServingRuntime(
+            servers=servers,
+            load_balancer_handle=load_balancer_handle,
+            gateway_count=gateway_count,
+            gateway_actor_kwargs={
+                "tokenizer": tokenizer,
+                "processor": processor,
+                "host": "127.0.0.1",
+            },
+        )
+        instance._runtime = runtime
+
+        if reward_fn is None:
+            def reward_fn(ctx):
+                return [0.0 for _ in ctx.trajectories]
+
+        if agent_runner is None:
+            agent_runner = stub_agent_runner
+
+        instance._framework = OpenAICompatibleAgentFramework(
+            session_runtime=runtime,
+            agent_runner=agent_runner,
+            reward_fn=reward_fn,
+            processor=processor,
+        )
+        return instance
 
     @property
     def rollout_replicas(self):
