@@ -8,6 +8,8 @@ from typing import Any
 from verl import DataProto
 from verl.utils.ray_utils import auto_await
 
+BACKFILL_NON_TENSOR_KEYS = ("data_source", "reward_model", "extra_info", "uid")
+
 
 class AgentFrameworkRolloutAdapter:
     """Drop-in replacement that adapts trainer DataProto to the agent framework."""
@@ -45,11 +47,24 @@ class AgentFrameworkRolloutAdapter:
         td_input = prompts.to_tensordict()
         td_output = self._generate_sequences_via_framework(td_input)
         output_dp = DataProto.from_tensordict(td_output)
-        output_dp.meta_info["timing"] = {"gen": time.monotonic() - start}
+        timing = {}
+        if isinstance(output_dp.meta_info.get("timing"), dict):
+            timing.update(output_dp.meta_info["timing"])
+        timing["gen"] = time.monotonic() - start
+        output_dp.meta_info["timing"] = timing
 
-        for key in ("data_source", "reward_model", "extra_info", "uid"):
-            if key in prompts.non_tensor_batch and key not in output_dp.non_tensor_batch:
-                output_dp.non_tensor_batch[key] = prompts.non_tensor_batch[key].copy()
+        missing_backfill_keys = [
+            key for key in BACKFILL_NON_TENSOR_KEYS if key in prompts.non_tensor_batch and key not in output_dp.non_tensor_batch
+        ]
+        if missing_backfill_keys and len(output_dp) != len(prompts):
+            raise ValueError(
+                "Cannot backfill non-tensor fields "
+                f"{missing_backfill_keys} when framework output batch size {len(output_dp)} "
+                f"does not match input batch size {len(prompts)}."
+            )
+
+        for key in missing_backfill_keys:
+            output_dp.non_tensor_batch[key] = prompts.non_tensor_batch[key].copy()
 
         return output_dp
 
