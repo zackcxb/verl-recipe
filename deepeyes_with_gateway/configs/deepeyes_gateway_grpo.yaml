@@ -1,0 +1,23 @@
+# Minimal phase-1 config skeleton for the DeepEyes gateway recipe.
+# Full PPO trainer/model/environment fields should come from the legacy config
+# and the real deployment setup when running actual training.
+defaults:
+  - _self_
+
+data:
+  custom_cls:
+    path: recipe/deepeyes_with_gateway/dataset.py
+    name: DeepEyesGatewayDataset
+
+actor_rollout_ref:
+  rollout:
+    agent:
+      agent_loop_manager_class: recipe.deepeyes_with_gateway.trainer_adapter.AgentFrameworkRolloutAdapter
+    custom:
+      agent_framework:
+        gateway_count: 8
+        max_turns: 1  # Phase 1 uses the single-turn stub agent runner.
+
+custom_reward_function:
+  path: recipe/deepeyes_with_gateway/reward.py
+  name: compute_score
