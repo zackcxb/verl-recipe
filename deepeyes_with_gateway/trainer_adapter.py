@@ -149,25 +149,6 @@ class AgentFrameworkRolloutAdapter:
         replay_buffer=None,
     ) -> "AgentFrameworkRolloutAdapter":
         del replay_buffer
-        manager = _get_agent_loop_manager_class()(
-            config=config,
-            worker_group=worker_group,
-            rollout_resource_pool=rollout_resource_pool,
-            teacher_model_manager=teacher_model_manager,
-            reward_loop_worker_handles=reward_loop_worker_handles,
-        )
-        await manager._initialize_llm_servers()
-        await manager._init_global_load_balancer()
-
-        servers = list(zip(manager.server_addresses, manager.server_handles, strict=True))
-        gateway_count = _get_config_value(
-            config,
-            "actor_rollout_ref.rollout.custom.agent_framework.gateway_count",
-            default=None,
-        )
-        if gateway_count is None:
-            gateway_count = len(servers)
-
         model_path = _get_config_value(config, "actor_rollout_ref.model.path", default=None)
         if model_path is None:
             raise ValueError("config.actor_rollout_ref.model.path is required for AgentFrameworkRolloutAdapter.create()")
@@ -185,12 +166,31 @@ class AgentFrameworkRolloutAdapter:
                 default=None,
             ),
         )
+        gateway_count = _get_config_value(
+            config,
+            "actor_rollout_ref.rollout.custom.agent_framework.gateway_count",
+            default=None,
+        )
         max_turns = _get_config_value(
             config,
             "actor_rollout_ref.rollout.custom.agent_framework.max_turns",
             default=None,
         )
         agent_runner = functools.partial(_get_stub_agent_runner(), max_turns=max_turns)
+
+        manager = _get_agent_loop_manager_class()(
+            config=config,
+            worker_group=worker_group,
+            rollout_resource_pool=rollout_resource_pool,
+            teacher_model_manager=teacher_model_manager,
+            reward_loop_worker_handles=reward_loop_worker_handles,
+        )
+        await manager._initialize_llm_servers()
+        await manager._init_global_load_balancer()
+
+        servers = list(zip(manager.server_addresses, manager.server_handles, strict=True))
+        if gateway_count is None:
+            gateway_count = len(servers)
 
         instance = cls.create_from_stub(
             servers=servers,
