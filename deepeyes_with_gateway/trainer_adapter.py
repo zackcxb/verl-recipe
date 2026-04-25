@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import time
 from typing import Any
 
@@ -9,6 +10,117 @@ from verl import DataProto
 from verl.utils.ray_utils import auto_await
 
 BACKFILL_NON_TENSOR_KEYS = ("data_source", "reward_model", "extra_info", "uid")
+MISSING = object()
+
+AgentLoopManager = None
+AutoProcessor = None
+AutoTokenizer = None
+GatewayServingRuntime = None
+OpenAICompatibleAgentFramework = None
+stub_agent_runner = None
+
+
+def _get_config_value(config: Any, path: str, default=None):
+    current = config
+    for part in path.split("."):
+        if current is None:
+            return default
+        if isinstance(current, dict):
+            current = current.get(part, MISSING)
+        else:
+            try:
+                current = getattr(current, part)
+            except AttributeError:
+                getter = getattr(current, "get", None)
+                if callable(getter):
+                    current = getter(part, MISSING)
+                else:
+                    try:
+                        current = current[part]
+                    except Exception:
+                        current = MISSING
+        if current is MISSING:
+            return default
+    return current
+
+
+def _get_agent_loop_manager_class():
+    global AgentLoopManager
+    if AgentLoopManager is None:
+        from verl.experimental.agent_loop.agent_loop import AgentLoopManager as agent_loop_manager_class
+
+        AgentLoopManager = agent_loop_manager_class
+    return AgentLoopManager
+
+
+def _get_gateway_runtime_class():
+    global GatewayServingRuntime
+    if GatewayServingRuntime is None:
+        from verl.agent.gateway.runtime import GatewayServingRuntime as gateway_runtime_class
+
+        GatewayServingRuntime = gateway_runtime_class
+    return GatewayServingRuntime
+
+
+def _get_framework_class():
+    global OpenAICompatibleAgentFramework
+    if OpenAICompatibleAgentFramework is None:
+        from verl.agent.framework.framework import OpenAICompatibleAgentFramework as framework_class
+
+        OpenAICompatibleAgentFramework = framework_class
+    return OpenAICompatibleAgentFramework
+
+
+def _get_stub_agent_runner():
+    global stub_agent_runner
+    if stub_agent_runner is None:
+        from recipe.deepeyes_with_gateway.agent_runner import stub_agent_runner as default_stub_agent_runner
+
+        stub_agent_runner = default_stub_agent_runner
+    return stub_agent_runner
+
+
+def _get_auto_tokenizer_class():
+    global AutoTokenizer
+    if AutoTokenizer is None:
+        from transformers import AutoTokenizer as auto_tokenizer_class
+
+        AutoTokenizer = auto_tokenizer_class
+    return AutoTokenizer
+
+
+def _get_auto_processor_class():
+    global AutoProcessor
+    if AutoProcessor is None:
+        from transformers import AutoProcessor as auto_processor_class
+
+        AutoProcessor = auto_processor_class
+    return AutoProcessor
+
+
+def _load_tokenizer_and_processor(model_path: str):
+    tokenizer = _get_auto_tokenizer_class().from_pretrained(model_path, trust_remote_code=True)
+    processor = None
+    try:
+        processor = _get_auto_processor_class().from_pretrained(model_path, trust_remote_code=True)
+    except Exception:
+        processor = None
+    return tokenizer, processor
+
+
+def _apply_custom_chat_template(tokenizer, processor, custom_chat_template) -> None:
+    if custom_chat_template is None:
+        return
+    tokenizer.chat_template = custom_chat_template
+    if processor is not None:
+        try:
+            processor.chat_template = custom_chat_template
+        except Exception:
+            pass
+
+
+def _zero_reward_fn(ctx):
+    return [0.0 for _ in ctx.trajectories]
 
 
 class AgentFrameworkRolloutAdapter:
@@ -32,12 +144,57 @@ class AgentFrameworkRolloutAdapter:
         reward_loop_worker_handles=None,
         teacher_model_manager=None,
     ) -> "AgentFrameworkRolloutAdapter":
-        del config
-        del worker_group
-        del rollout_resource_pool
-        del reward_loop_worker_handles
-        del teacher_model_manager
-        return cls()
+        manager = _get_agent_loop_manager_class()(
+            config=config,
+            worker_group=worker_group,
+            rollout_resource_pool=rollout_resource_pool,
+            teacher_model_manager=teacher_model_manager,
+            reward_loop_worker_handles=reward_loop_worker_handles,
+        )
+        await manager._initialize_llm_servers()
+        await manager._init_global_load_balancer()
+
+        servers = list(zip(manager.server_addresses, manager.server_handles, strict=True))
+        gateway_count = _get_config_value(
+            config,
+            "actor_rollout_ref.rollout.custom.agent_framework.gateway_count",
+            default=None,
+        )
+        if gateway_count is None:
+            gateway_count = len(servers)
+
+        model_path = _get_config_value(config, "actor_rollout_ref.model.path", default=None)
+        if model_path is None:
+            raise ValueError("config.actor_rollout_ref.model.path is required for AgentFrameworkRolloutAdapter.create()")
+
+        tokenizer, processor = _load_tokenizer_and_processor(model_path)
+        _apply_custom_chat_template(
+            tokenizer=tokenizer,
+            processor=processor,
+            custom_chat_template=_get_config_value(
+                config,
+                "actor_rollout_ref.model.custom_chat_template",
+                default=None,
+            ),
+        )
+        max_turns = _get_config_value(
+            config,
+            "actor_rollout_ref.rollout.custom.agent_framework.max_turns",
+            default=None,
+        )
+        agent_runner = functools.partial(_get_stub_agent_runner(), max_turns=max_turns)
+
+        instance = cls.create_from_stub(
+            servers=servers,
+            load_balancer_handle=manager.global_load_balancer,
+            tokenizer=tokenizer,
+            processor=processor,
+            agent_runner=agent_runner,
+            reward_fn=_zero_reward_fn,
+            gateway_count=gateway_count,
+        )
+        instance._rollout_replicas = manager.rollout_replicas
+        return instance
 
     @classmethod
     def create_from_stub(
@@ -52,16 +209,12 @@ class AgentFrameworkRolloutAdapter:
         gateway_count: int = 1,
     ) -> "AgentFrameworkRolloutAdapter":
         """Create an adapter wired to a stub-backed GatewayServingRuntime for tests."""
-        from recipe.deepeyes_with_gateway.agent_runner import stub_agent_runner
-        from verl.agent.framework.framework import OpenAICompatibleAgentFramework
-        from verl.agent.gateway.runtime import GatewayServingRuntime
-
         instance = cls()
         instance._server_addresses = [server_id for server_id, _ in servers]
         instance._server_handles = [handle for _, handle in servers]
         instance._load_balancer = load_balancer_handle
 
-        runtime = GatewayServingRuntime(
+        runtime = _get_gateway_runtime_class()(
             servers=servers,
             load_balancer_handle=load_balancer_handle,
             gateway_count=gateway_count,
@@ -74,13 +227,12 @@ class AgentFrameworkRolloutAdapter:
         instance._runtime = runtime
 
         if reward_fn is None:
-            def reward_fn(ctx):
-                return [0.0 for _ in ctx.trajectories]
+            reward_fn = _zero_reward_fn
 
         if agent_runner is None:
-            agent_runner = stub_agent_runner
+            agent_runner = _get_stub_agent_runner()
 
-        instance._framework = OpenAICompatibleAgentFramework(
+        instance._framework = _get_framework_class()(
             session_runtime=runtime,
             agent_runner=agent_runner,
             reward_fn=reward_fn,
