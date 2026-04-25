@@ -20,6 +20,7 @@ OpenAICompatibleAgentFramework = None
 get_custom_reward_fn = None
 hf_processor = None
 hf_tokenizer = None
+load_extern_object = None
 stub_agent_runner = None
 
 
@@ -110,6 +111,15 @@ def _get_custom_reward_fn_loader():
     return get_custom_reward_fn
 
 
+def _get_load_extern_object_loader():
+    global load_extern_object
+    if load_extern_object is None:
+        from verl.utils.import_utils import load_extern_object as extern_object_loader
+
+        load_extern_object = extern_object_loader
+    return load_extern_object
+
+
 def _load_tokenizer_and_processor(model_path: str, *, trust_remote_code: bool):
     tokenizer = _get_hf_tokenizer_helper()(model_path, trust_remote_code=trust_remote_code)
     processor = _get_hf_processor_helper()(model_path, trust_remote_code=trust_remote_code)
@@ -137,6 +147,35 @@ def _zero_reward_fn(ctx):
     return [0.0 for _ in ctx.trajectories]
 
 
+def _call_reward_with_kwargs(raw_fn, extra_kwargs, *args, **kwargs):
+    merged_kwargs = {**kwargs, **extra_kwargs}
+    return raw_fn(*args, **merged_kwargs)
+
+
+async def _call_reward_with_kwargs_async(raw_fn, extra_kwargs, *args, **kwargs):
+    merged_kwargs = {**kwargs, **extra_kwargs}
+    return await raw_fn(*args, **merged_kwargs)
+
+
+def _get_compatible_custom_reward_fn(config: Any):
+    custom_reward_fn = _get_custom_reward_fn_loader()(config)
+    if custom_reward_fn is not None:
+        return custom_reward_fn
+
+    module_path = _get_config_value(config, "custom_reward_function.path", default=None)
+    if not module_path:
+        return None
+
+    fn_name = _get_config_value(config, "custom_reward_function.name", default=None)
+    assert fn_name is not None
+
+    raw_fn = _get_load_extern_object_loader()(module_path=module_path, object_name=fn_name)
+    reward_kwargs = dict(_get_config_value(config, "custom_reward_function.reward_kwargs", default={}) or {})
+    if inspect.iscoroutinefunction(raw_fn):
+        return functools.partial(_call_reward_with_kwargs_async, raw_fn, reward_kwargs)
+    return functools.partial(_call_reward_with_kwargs, raw_fn, reward_kwargs)
+
+
 def _extract_ground_truth(sample_fields: dict[str, Any]):
     reward_model = sample_fields.get("reward_model")
     if isinstance(reward_model, dict):
@@ -147,7 +186,7 @@ def _extract_ground_truth(sample_fields: dict[str, Any]):
 
 
 def _build_framework_reward_fn(*, config: Any, tokenizer):
-    custom_reward_fn = _get_custom_reward_fn_loader()(config)
+    custom_reward_fn = _get_compatible_custom_reward_fn(config)
     if custom_reward_fn is None:
         return _zero_reward_fn
 
