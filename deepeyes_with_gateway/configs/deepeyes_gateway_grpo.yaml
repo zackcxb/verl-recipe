@@ -1,7 +1,11 @@
 # Minimal phase-1 config skeleton for the DeepEyes gateway recipe.
-# Full PPO trainer/model/environment fields should come from the legacy config
-# and the real deployment setup when running actual training.
+# Inherits all PPO trainer defaults; recipe only overrides what's different.
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
 defaults:
+  - ppo_trainer
   - _self_
 
 data:
