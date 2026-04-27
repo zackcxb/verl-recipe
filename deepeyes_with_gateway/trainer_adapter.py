@@ -1,8 +1,19 @@
 """Compatibility facade: lets RayPPOTrainer consume OpenAICompatibleAgentFramework.
 
-Modeled after the wiring pattern in ``verl/trainer/ppo/ray_trainer.py`` and the
-server ownership split in PR #6129, but kept intentionally minimal for the
-phase-1 vertical slice.
+RayPPOTrainer expects its rollout manager to expose:
+  - create(config, worker_group, ...) — class method called by init_workers()
+  - generate_sequences(DataProto) -> DataProto — called each training step
+  - rollout_replicas — used by CheckpointEngineManager for weight sync
+  - start_profile() / stop_profile() / clear_kv_cache()
+
+This adapter satisfies that contract while internally delegating rollout
+generation to the new agent framework (TensorDict-native). The DataProto <->
+TensorDict conversion happens at the generate_sequences boundary.
+
+Server initialization reuses the legacy AgentLoopManager path (instantiate,
+call _initialize_llm_servers + _init_global_load_balancer, then take its
+server handles/addresses/replicas). This will be replaced by LLMServerManager
+once PR #6129 lands upstream.
 """
 
 from __future__ import annotations
@@ -14,16 +25,23 @@ from functools import partial
 from typing import Any
 
 from verl import DataProto
+# Agent framework: TensorDict-native session/trajectory orchestration
 from verl.agent.framework.framework import OpenAICompatibleAgentFramework
+# Gateway runtime: manages gateway actors and session lifecycle
 from verl.agent.gateway.runtime import GatewayServingRuntime
+# Legacy server init path — used to bootstrap rollout replicas and load balancer
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
+# Trainer reward loading utility (config.reward.custom_reward_function)
 from verl.trainer.ppo.reward import get_custom_reward_fn
 from verl.utils.import_utils import load_extern_object
 from verl.utils.ray_utils import auto_await
+# Shared tokenizer/processor loaders used across verl
 from verl.utils.tokenizer import hf_processor, hf_tokenizer
 
 from recipe.deepeyes_with_gateway.agent_runner import stub_agent_runner
 
+# Non-tensor fields that trainer expects on the output DataProto but the
+# framework doesn't produce (they come from the input batch).
 BACKFILL_NON_TENSOR_KEYS = ("data_source", "reward_model", "extra_info", "uid")
 
 
@@ -46,6 +64,14 @@ class AgentFrameworkRolloutAdapter:
         teacher_model_manager=None,
         **kwargs,
     ) -> "AgentFrameworkRolloutAdapter":
+        """Entry point called by RayPPOTrainer.init_workers() via agent_loop_manager_class.
+
+        Wiring order:
+        1. Load tokenizer/processor and apply custom chat template
+        2. Bootstrap rollout servers via legacy AgentLoopManager path
+        3. Read recipe-specific config from rollout.custom.agent_framework
+        4. Construct GatewayServingRuntime + OpenAICompatibleAgentFramework
+        """
         del kwargs
 
         model_path = config.actor_rollout_ref.model.path
@@ -57,15 +83,22 @@ class AgentFrameworkRolloutAdapter:
             "trust_remote_code",
             getattr(getattr(config, "data", None), "trust_remote_code", True),
         )
+        # Tokenizer/processor determine both chat template rendering and
+        # multimodal postprocess behavior (position_ids / multi_modal_inputs).
         tokenizer = hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
         processor = hf_processor(model_path, trust_remote_code=trust_remote_code)
 
+        # DeepEyes still relies on the legacy custom Jinja2 template. We inject
+        # it here so gateway encoding uses the same template as legacy rollout.
         custom_chat_template = getattr(config.actor_rollout_ref.model, "custom_chat_template", None)
         if custom_chat_template:
             tokenizer.chat_template = custom_chat_template
             if processor is not None:
                 processor.chat_template = custom_chat_template
 
+        # Phase 1 deliberately reuses the legacy server bootstrap instead of
+        # introducing a local server component abstraction. The adapter only
+        # keeps the resulting replicas for profiling / cache management.
         manager = AgentLoopManager(
             config=config,
             worker_group=worker_group,
@@ -78,6 +111,9 @@ class AgentFrameworkRolloutAdapter:
 
         servers = list(zip(manager.server_addresses, manager.server_handles, strict=True))
         rollout_cfg = config.actor_rollout_ref.rollout
+        # Keep config access local and obvious: OmegaConf supports .get(), but
+        # unit tests build SimpleNamespace configs, so we handle that one narrow
+        # compatibility seam here instead of a generic deep-path helper.
         if hasattr(rollout_cfg, "get"):
             agent_framework_cfg = rollout_cfg.get("custom", {}).get("agent_framework", {})
         else:
@@ -97,6 +133,9 @@ class AgentFrameworkRolloutAdapter:
         )
         agent_runner = partial(stub_agent_runner, max_turns=max_turns)
 
+        # Phase 1 uses the existing runtime shape unchanged: it owns gateway
+        # actors and still performs backend routing itself. We only pass the
+        # servers/load balancer that came from legacy bootstrap.
         instance = cls.create_from_stub(
             servers=servers,
             load_balancer_handle=manager.global_load_balancer,
@@ -149,16 +188,26 @@ class AgentFrameworkRolloutAdapter:
         return self._rollout_replicas
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
+        """Bridge trainer rollout contract to the TensorDict-native framework.
+
+        Trainer sends DataProto; framework returns TensorDict. This method is the
+        only place where we translate between the two worlds.
+        """
         start = time.monotonic()
         td_output = self._generate_sequences_via_framework(prompts.to_tensordict())
         output_dp = DataProto.from_tensordict(td_output)
 
+        # Framework may provide detailed timing later; phase 1 only guarantees a
+        # top-level `gen` duration so trainer-side logging has a stable key.
         timing = {}
         if isinstance(output_dp.meta_info.get("timing"), dict):
             timing.update(output_dp.meta_info["timing"])
         timing["gen"] = time.monotonic() - start
         output_dp.meta_info["timing"] = timing
 
+        # Trainer expects certain non-tensor fields (uid, data_source, etc.) on
+        # the output. The framework doesn't propagate them because it only sees
+        # TensorDict. We copy them from the input when batch sizes match.
         missing_keys = [
             key for key in BACKFILL_NON_TENSOR_KEYS if key in prompts.non_tensor_batch and key not in output_dp.non_tensor_batch
         ]
@@ -191,6 +240,12 @@ class AgentFrameworkRolloutAdapter:
 
 # ---------------------------------------------------------------------------
 # Reward helpers
+#
+# The framework expects reward_fn(ctx) -> list[float], where ctx carries
+# trajectories and sample_fields. The trainer configures reward via either:
+#   1. config.reward.custom_reward_function (verl standard path)
+#   2. config.custom_reward_function (legacy top-level path, used by DeepEyes)
+# _build_reward_fn bridges whichever is present into the framework interface.
 # ---------------------------------------------------------------------------
 
 def _zero_reward_fn(ctx):
