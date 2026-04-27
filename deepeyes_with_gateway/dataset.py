@@ -7,6 +7,7 @@ It does not perform tokenization or vision processing.
 from __future__ import annotations
 
 import copy
+import base64
 import re
 from io import BytesIO
 import logging
@@ -49,7 +50,8 @@ class DeepEyesGatewayDataset(RLHFDataset):
                 if segment == "<image>":
                     if image_offset >= len(images):
                         raise ValueError(f"image placeholder count exceeds images at index {image_offset}")
-                    content_list.append({"type": "image", "image": _load_image(images[image_offset])})
+                    image = _load_image(images[image_offset])
+                    content_list.append({"type": "image", "image": _image_to_data_uri(image)})
                     image_offset += 1
                 elif segment == "<video>":
                     if video_offset >= len(videos):
@@ -151,9 +153,29 @@ def _normalize_content_part(part):
     if part.get("type") in {"image", "image_url"} and "bytes" in part and "image" not in part:
         normalized = dict(part)
         normalized["type"] = "image"
-        normalized["image"] = _load_image(part)
+        normalized["image"] = _image_to_data_uri(_load_image(part))
+        normalized.pop("bytes", None)
+        return normalized
+    if part.get("type") in {"image", "image_url"} and isinstance(part.get("image"), Image.Image):
+        normalized = dict(part)
+        normalized["type"] = "image"
+        normalized["image"] = _image_to_data_uri(part["image"].convert("RGB"))
         return normalized
     return part
+
+
+def _image_to_data_uri(image: Image.Image) -> str:
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _image_from_data_uri(data_uri: str) -> Image.Image | None:
+    if not data_uri.startswith("data:image") or "base64," not in data_uri:
+        return None
+    _, encoded = data_uri.split("base64,", 1)
+    return Image.open(BytesIO(base64.b64decode(encoded))).convert("RGB")
 
 
 def _first_image_from_messages(messages):
@@ -166,4 +188,8 @@ def _first_image_from_messages(messages):
                 image = part.get("image")
                 if isinstance(image, Image.Image):
                     return image
+                if isinstance(image, str):
+                    decoded = _image_from_data_uri(image)
+                    if decoded is not None:
+                        return decoded
     return None

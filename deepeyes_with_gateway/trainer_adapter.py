@@ -52,6 +52,20 @@ def _sample_value(values, sample_index: int):
     return values[sample_index]
 
 
+def _dataproto_to_framework_tensordict(prompts: DataProto):
+    """Convert trainer DataProto to the framework TensorDict contract.
+
+    Async agent rollout batches can be non-tensor only: RayPPOTrainer strips
+    token tensors before calling the rollout manager and keeps raw_prompt /
+    reward fields in non_tensor_batch. DataProto.to_tensordict() currently
+    assumes batch is present, so the adapter handles that trainer shape here.
+    """
+    tensor_dict = prompts.batch.to_dict() if prompts.batch is not None else {}
+    for key, value in prompts.non_tensor_batch.items():
+        tensor_dict[key] = value.tolist() if hasattr(value, "tolist") else list(value)
+    return tu.get_tensordict(tensor_dict=tensor_dict)
+
+
 class AgentFrameworkRolloutAdapter:
     """Drop-in replacement for AgentLoopManager that delegates to the agent framework."""
 
@@ -212,7 +226,8 @@ class AgentFrameworkRolloutAdapter:
         only place where we translate between the two worlds.
         """
         start = time.monotonic()
-        td_output = self._generate_sequences_via_framework(prompts.to_tensordict())
+        td_input = _dataproto_to_framework_tensordict(prompts)
+        td_output = self._generate_sequences_via_framework(td_input)
         output_dp = DataProto.from_tensordict(td_output)
 
         # Framework may provide detailed timing later; phase 1 only guarantees a
@@ -249,6 +264,15 @@ class AgentFrameworkRolloutAdapter:
             return await self._framework.generate_sequences(td_input)
 
         original_agent_runner = self._framework.agent_runner
+
+        # Phase 1 injects per-sample tools_kwargs by temporarily wrapping the
+        # framework's agent_runner. This relies on the current synchronous
+        # trainer contract: one caller invokes generate_sequences at a time.
+        # Concurrent sessions within a batch are safe because the wrapper reads
+        # tools_kwargs by sample_index, but concurrent generate_sequences calls
+        # from different callers would race on this mutation. If async rollout
+        # later needs multiple concurrent callers, framework-level forwarding of
+        # per-sample non-tensor fields will be a better long-term fix.
 
         async def agent_runner_with_tools_kwargs(*, raw_prompt, session, sample_index, **kwargs):
             kwargs.setdefault("tools_kwargs", _sample_value(tools_kwargs_by_sample, sample_index))
