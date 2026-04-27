@@ -33,16 +33,23 @@ from verl.agent.gateway.runtime import GatewayServingRuntime
 from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 # Trainer reward loading utility (config.reward.custom_reward_function)
 from verl.trainer.ppo.reward import get_custom_reward_fn
+from verl.utils import tensordict_utils as tu
 from verl.utils.import_utils import load_extern_object
 from verl.utils.ray_utils import auto_await
 # Shared tokenizer/processor loaders used across verl
 from verl.utils.tokenizer import hf_processor, hf_tokenizer
 
-from recipe.deepeyes_with_gateway.agent_runner import stub_agent_runner
+from recipe.deepeyes_with_gateway.agent_runner import deepeyes_agent_runner, stub_agent_runner
 
 # Non-tensor fields that trainer expects on the output DataProto but the
 # framework doesn't produce (they come from the input batch).
 BACKFILL_NON_TENSOR_KEYS = ("data_source", "reward_model", "extra_info", "uid")
+
+
+def _sample_value(values, sample_index: int):
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+    return values[sample_index]
 
 
 class AgentFrameworkRolloutAdapter:
@@ -131,7 +138,11 @@ class AgentFrameworkRolloutAdapter:
             if hasattr(agent_framework_cfg, "get")
             else getattr(agent_framework_cfg, "max_turns", None)
         )
-        agent_runner = partial(stub_agent_runner, max_turns=max_turns)
+        agent_runner = (
+            partial(deepeyes_agent_runner, max_turns=max_turns)
+            if max_turns is not None
+            else partial(deepeyes_agent_runner)
+        )
 
         # Phase 1 uses the existing runtime shape unchanged: it owns gateway
         # actors and still performs backend routing itself. We only pass the
@@ -209,7 +220,9 @@ class AgentFrameworkRolloutAdapter:
         # the output. The framework doesn't propagate them because it only sees
         # TensorDict. We copy them from the input when batch sizes match.
         missing_keys = [
-            key for key in BACKFILL_NON_TENSOR_KEYS if key in prompts.non_tensor_batch and key not in output_dp.non_tensor_batch
+            key
+            for key in BACKFILL_NON_TENSOR_KEYS
+            if key in prompts.non_tensor_batch and key not in output_dp.non_tensor_batch
         ]
         if missing_keys and len(output_dp) != len(prompts):
             raise ValueError(
@@ -223,7 +236,30 @@ class AgentFrameworkRolloutAdapter:
     async def _generate_sequences_via_framework(self, td_input):
         if self._framework is None:
             raise RuntimeError("framework must be initialized before generate_sequences")
-        return await self._framework.generate_sequences(td_input)
+
+        tools_kwargs_by_sample = tu.get(td_input, "tools_kwargs")
+        if tools_kwargs_by_sample is None or not hasattr(self._framework, "agent_runner"):
+            return await self._framework.generate_sequences(td_input)
+
+        original_agent_runner = self._framework.agent_runner
+
+        async def agent_runner_with_tools_kwargs(*, raw_prompt, session, sample_index, **kwargs):
+            kwargs.setdefault("tools_kwargs", _sample_value(tools_kwargs_by_sample, sample_index))
+            result = original_agent_runner(
+                raw_prompt=raw_prompt,
+                session=session,
+                sample_index=sample_index,
+                **kwargs,
+            )
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        self._framework.agent_runner = agent_runner_with_tools_kwargs
+        try:
+            return await self._framework.generate_sequences(td_input)
+        finally:
+            self._framework.agent_runner = original_agent_runner
 
     @auto_await
     async def start_profile(self, **kwargs):
