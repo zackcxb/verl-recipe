@@ -20,7 +20,8 @@ actor_rollout_ref:
     custom:
       agent_framework:
         gateway_count: 8
-        max_turns: 1  # Phase 1 uses the single-turn stub agent runner.
+        max_turns: 5
+        tool_config_path: recipe/deepeyes_with_gateway/configs/image_zoom_in_tool_config.yaml
 
 custom_reward_function:
   path: recipe/deepeyes_with_gateway/reward.py

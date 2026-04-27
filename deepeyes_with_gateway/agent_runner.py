@@ -1,15 +1,17 @@
 """Agent runners for the DeepEyes gateway recipe.
 
 Phase 1 provides a stub single-turn runner for the vertical slice.
-Phase 2 will add a deeper multi-turn DeepEyes-specific runner.
+Phase 2 adds the multi-turn DeepEyes-specific runner with ImageZoomInTool.
 """
 
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 import httpx
+import yaml
 
 from verl.agent.framework.types import SessionHandle
 from verl.tools.image_zoom_in_tool import ImageZoomInTool
@@ -19,33 +21,17 @@ from verl.tools.schemas import OpenAIFunctionToolSchema, ToolResponse
 IMAGE_ZOOM_IN_TOOL_NAMES = ("image_zoom_in_tool", "image_zoom_in")
 
 
-def _default_image_zoom_in_tool_schema() -> OpenAIFunctionToolSchema:
-    return OpenAIFunctionToolSchema.model_validate(
-        {
-            "type": "function",
-            "function": {
-                "name": "image_zoom_in_tool",
-                "description": (
-                    "Zoom in on a specific region of an image by cropping it based on a bounding box and an "
-                    "optional object label."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "bbox_2d": {
-                            "type": "array",
-                            "description": "The bounding box as [x1, y1, x2, y2].",
-                        },
-                        "label": {
-                            "type": "string",
-                            "description": "The optional name or label of the object in the bounding box.",
-                        },
-                    },
-                    "required": ["bbox_2d"],
-                },
-            },
-        }
-    )
+def load_tool_config(tool_config_path: str | None) -> dict[str, Any]:
+    """Load tool configuration from yaml. Returns first tool entry or empty dict."""
+    if not tool_config_path:
+        return {}
+    path = Path(tool_config_path)
+    if not path.is_file():
+        return {}
+    with open(path) as f:
+        data = yaml.safe_load(f) or {}
+    tools = data.get("tools", [])
+    return tools[0] if tools else {}
 
 
 def _extract_image_zoom_in_kwargs(tools_kwargs: dict | None) -> dict[str, Any]:
@@ -127,6 +113,7 @@ async def deepeyes_agent_runner(
     session: SessionHandle,
     sample_index: int,
     tools_kwargs: dict | None = None,
+    tool_config: dict | None = None,
     max_turns: int = 5,
     **kwargs,
 ) -> None:
@@ -135,6 +122,7 @@ async def deepeyes_agent_runner(
     if session.base_url is None:
         raise ValueError("session.base_url is required for deepeyes_agent_runner")
 
+    tool_config = tool_config or {}
     image_tool_kwargs = _extract_image_zoom_in_kwargs(tools_kwargs)
     create_kwargs = dict(image_tool_kwargs.get("create_kwargs") or {})
     if "image" not in create_kwargs and "image" in image_tool_kwargs:
@@ -142,10 +130,29 @@ async def deepeyes_agent_runner(
     execute_kwargs = dict(image_tool_kwargs.get("execute_kwargs") or {})
     release_kwargs = dict(image_tool_kwargs.get("release_kwargs") or {})
 
-    image_tool = ImageZoomInTool(
-        config={"num_workers": 1, "rate_limit": 1},
-        tool_schema=_default_image_zoom_in_tool_schema(),
-    )
+    # Tool config and schema from yaml (or defaults for testing)
+    tool_init_config = tool_config.get("config", {"num_workers": 1, "rate_limit": 1})
+    tool_schema_dict = tool_config.get("tool_schema")
+    if tool_schema_dict:
+        tool_schema = OpenAIFunctionToolSchema.model_validate(tool_schema_dict)
+    else:
+        tool_schema = OpenAIFunctionToolSchema.model_validate({
+            "type": "function",
+            "function": {
+                "name": "image_zoom_in_tool",
+                "description": "Zoom in on a specific region of an image.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "bbox_2d": {"type": "array", "description": "Bounding box [x1, y1, x2, y2]."},
+                        "label": {"type": "string", "description": "Object label."},
+                    },
+                    "required": ["bbox_2d"],
+                },
+            },
+        })
+
+    image_tool = ImageZoomInTool(config=tool_init_config, tool_schema=tool_schema)
     tool_instance_id: str | None = None
     messages = list(raw_prompt)
 

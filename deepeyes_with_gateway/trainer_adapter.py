@@ -138,10 +138,17 @@ class AgentFrameworkRolloutAdapter:
             if hasattr(agent_framework_cfg, "get")
             else getattr(agent_framework_cfg, "max_turns", None)
         )
+        tool_config_path = (
+            agent_framework_cfg.get("tool_config_path")
+            if hasattr(agent_framework_cfg, "get")
+            else getattr(agent_framework_cfg, "tool_config_path", None)
+        )
+        from recipe.deepeyes_with_gateway.agent_runner import load_tool_config
+        tool_config = load_tool_config(tool_config_path)
         agent_runner = (
-            partial(deepeyes_agent_runner, max_turns=max_turns)
+            partial(deepeyes_agent_runner, tool_config=tool_config, max_turns=max_turns)
             if max_turns is not None
-            else partial(deepeyes_agent_runner)
+            else partial(deepeyes_agent_runner, tool_config=tool_config)
         )
 
         # Phase 1 uses the existing runtime shape unchanged: it owns gateway
