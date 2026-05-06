@@ -110,8 +110,9 @@ class DeepEyesGatewayDataset(RLHFDataset):
                 "content": user_content,
             },
         ]
-        if self.negative_prompt_key in row_dict:
-            row_dict["raw_negative_prompt"] = self._build_messages(row_dict, key=self.negative_prompt_key)
+        negative_prompt_key = getattr(self, "negative_prompt_key", None)
+        if negative_prompt_key and negative_prompt_key in row_dict:
+            row_dict["raw_negative_prompt"] = self._build_messages(row_dict, key=negative_prompt_key)
 
         row_dict.pop(self.image_key, None)
         row_dict.pop(self.video_key, None)
