@@ -48,6 +48,8 @@ actor_rollout_ref:
   rollout:
     name: sglang
     mode: async
+    multi_turn:
+      format: hermes
     n: 2
     log_prob_micro_batch_size_per_gpu: 1
     tensor_model_parallel_size: 1

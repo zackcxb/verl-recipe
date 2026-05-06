@@ -50,6 +50,24 @@ def _sample_value(values, sample_index: int):
     return values[sample_index]
 
 
+def _config_get(config_obj, key: str, default=None):
+    if config_obj is None:
+        return default
+    if hasattr(config_obj, "get"):
+        return config_obj.get(key, default)
+    return getattr(config_obj, key, default)
+
+
+def _get_tool_parser_name(rollout_cfg, agent_framework_cfg) -> str:
+    multi_turn_cfg = _config_get(rollout_cfg, "multi_turn", {})
+    tool_parser_name = _config_get(multi_turn_cfg, "format")
+    if tool_parser_name:
+        return tool_parser_name
+
+    tool_parser_name = _config_get(agent_framework_cfg, "tool_parser_name")
+    return tool_parser_name or "hermes"
+
+
 def _dataproto_to_framework_tensordict(prompts: DataProto):
     """Convert trainer DataProto to the framework TensorDict contract.
 
@@ -148,6 +166,7 @@ class AgentFrameworkRolloutAdapter:
             agent_framework_cfg = getattr(custom_cfg, "agent_framework", None)
             if agent_framework_cfg is None:
                 agent_framework_cfg = {}
+        tool_parser_name = _get_tool_parser_name(rollout_cfg, agent_framework_cfg)
         gateway_count = (
             agent_framework_cfg.get("gateway_count")
             if hasattr(agent_framework_cfg, "get")
@@ -183,6 +202,7 @@ class AgentFrameworkRolloutAdapter:
             reward_fn=_build_reward_fn(config, tokenizer),
             gateway_count=gateway_count,
             host=None,
+            tool_parser_name=tool_parser_name,
         )
         instance._rollout_replicas = rollout_replicas
         return instance
@@ -199,6 +219,7 @@ class AgentFrameworkRolloutAdapter:
         reward_fn=None,
         gateway_count: int = 1,
         host: str | None = "127.0.0.1",
+        tool_parser_name: str | None = None,
     ) -> "AgentFrameworkRolloutAdapter":
         """Create adapter with explicit stub components (for tests)."""
         instance = cls()
@@ -210,6 +231,7 @@ class AgentFrameworkRolloutAdapter:
                 "tokenizer": tokenizer,
                 "processor": processor,
                 "host": host,
+                "tool_parser_name": tool_parser_name,
             },
         )
         instance._runtime = runtime
