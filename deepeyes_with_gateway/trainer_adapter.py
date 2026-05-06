@@ -3,17 +3,16 @@
 RayPPOTrainer expects its rollout manager to expose:
   - create(config, worker_group, ...) — class method called by init_workers()
   - generate_sequences(DataProto) -> DataProto — called each training step
-  - rollout_replicas — used by CheckpointEngineManager for weight sync
+  - rollout_replicas — compatibility for older trainer paths
   - start_profile() / stop_profile() / clear_kv_cache()
 
 This adapter satisfies that contract while internally delegating rollout
 generation to the new agent framework (TensorDict-native). The DataProto <->
 TensorDict conversion happens at the generate_sequences boundary.
 
-Server initialization reuses the legacy AgentLoopManager path (instantiate,
-call _initialize_llm_servers + _init_global_load_balancer, then take its
-server handles/addresses/replicas). This will be replaced by LLMServerManager
-once PR #6129 lands upstream.
+Server initialization follows PR #6129: rollout server lifecycle lives in
+LLMServerManager, while this adapter consumes either the trainer-provided
+LLMServerClient or a locally created LLMServerManager.
 """
 
 from __future__ import annotations
@@ -29,8 +28,6 @@ from verl import DataProto
 from verl.agent.framework.framework import OpenAICompatibleAgentFramework
 # Gateway runtime: manages gateway actors and session lifecycle
 from verl.agent.gateway.runtime import GatewayServingRuntime
-# Legacy server init path — used to bootstrap rollout replicas and load balancer
-from verl.experimental.agent_loop.agent_loop import AgentLoopManager
 # Trainer reward loading utility (config.reward.custom_reward_function)
 from verl.trainer.ppo.reward import get_custom_reward_fn
 from verl.utils import tensordict_utils as tu
@@ -38,6 +35,7 @@ from verl.utils.import_utils import load_extern_object
 from verl.utils.ray_utils import auto_await
 # Shared tokenizer/processor loaders used across verl
 from verl.utils.tokenizer import hf_processor, hf_tokenizer
+from verl.workers.rollout.llm_server import LLMServerManager
 
 from recipe.deepeyes_with_gateway.agent_runner import deepeyes_agent_runner, stub_agent_runner
 
@@ -81,6 +79,8 @@ class AgentFrameworkRolloutAdapter:
         config,
         worker_group=None,
         rollout_resource_pool=None,
+        llm_client=None,
+        teacher_client=None,
         reward_loop_worker_handles=None,
         teacher_model_manager=None,
         **kwargs,
@@ -89,11 +89,11 @@ class AgentFrameworkRolloutAdapter:
 
         Wiring order:
         1. Load tokenizer/processor and apply custom chat template
-        2. Bootstrap rollout servers via legacy AgentLoopManager path
+        2. Consume trainer-provided LLMServerClient or bootstrap LLMServerManager
         3. Read recipe-specific config from rollout.custom.agent_framework
         4. Construct GatewayServingRuntime + OpenAICompatibleAgentFramework
         """
-        del kwargs
+        del teacher_client, teacher_model_manager, reward_loop_worker_handles, kwargs
 
         model_path = config.actor_rollout_ref.model.path
         if model_path is None:
@@ -117,20 +117,26 @@ class AgentFrameworkRolloutAdapter:
             if processor is not None:
                 processor.chat_template = custom_chat_template
 
-        # Phase 1 deliberately reuses the legacy server bootstrap instead of
-        # introducing a local server component abstraction. The adapter only
-        # keeps the resulting replicas for profiling / cache management.
-        manager = AgentLoopManager(
-            config=config,
-            worker_group=worker_group,
-            rollout_resource_pool=rollout_resource_pool,
-            teacher_model_manager=teacher_model_manager,
-            reward_loop_worker_handles=reward_loop_worker_handles,
-        )
-        await manager._initialize_llm_servers()
-        await manager._init_global_load_balancer()
+        if llm_client is not None:
+            servers_by_id = getattr(llm_client, "_server_id_to_handle", None)
+            load_balancer_handle = getattr(llm_client, "_load_balancer", None)
+            if servers_by_id is None or load_balancer_handle is None:
+                raise ValueError("llm_client must expose server handles and a load balancer")
+            servers = list(servers_by_id.items())
+            rollout_replicas = []
+        else:
+            maybe_manager = LLMServerManager.create(
+                config=config,
+                worker_group=worker_group,
+                rollout_resource_pool=rollout_resource_pool,
+            )
+            llm_server_manager = await maybe_manager if inspect.isawaitable(maybe_manager) else maybe_manager
+            servers = list(
+                zip(llm_server_manager.server_addresses, llm_server_manager.server_handles, strict=True)
+            )
+            load_balancer_handle = llm_server_manager.global_load_balancer
+            rollout_replicas = llm_server_manager.get_replicas()
 
-        servers = list(zip(manager.server_addresses, manager.server_handles, strict=True))
         rollout_cfg = config.actor_rollout_ref.rollout
         # Keep config access local and obvious: OmegaConf supports .get(), but
         # unit tests build SimpleNamespace configs, so we handle that one narrow
@@ -167,10 +173,10 @@ class AgentFrameworkRolloutAdapter:
 
         # Phase 1 uses the existing runtime shape unchanged: it owns gateway
         # actors and still performs backend routing itself. We only pass the
-        # servers/load balancer that came from legacy bootstrap.
+        # servers/load balancer that came from LLMServerManager/LLMServerClient.
         instance = cls.create_from_stub(
             servers=servers,
-            load_balancer_handle=manager.global_load_balancer,
+            load_balancer_handle=load_balancer_handle,
             tokenizer=tokenizer,
             processor=processor,
             agent_runner=agent_runner,
@@ -178,7 +184,7 @@ class AgentFrameworkRolloutAdapter:
             gateway_count=gateway_count,
             host=None,
         )
-        instance._rollout_replicas = manager.rollout_replicas
+        instance._rollout_replicas = rollout_replicas
         return instance
 
     @classmethod
