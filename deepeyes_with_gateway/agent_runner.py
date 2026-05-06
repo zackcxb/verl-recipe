@@ -6,12 +6,15 @@ Phase 2 adds the multi-turn DeepEyes-specific runner with ImageZoomInTool.
 
 from __future__ import annotations
 
+import base64
 import json
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import httpx
 import yaml
+from PIL import Image
 
 from verl.agent.framework.types import SessionHandle
 from verl.tools.image_zoom_in_tool import ImageZoomInTool
@@ -69,15 +72,25 @@ def _assistant_message_from_response(payload: dict[str, Any]) -> dict[str, Any]:
     return message
 
 
+def _image_to_data_uri(image: Image.Image) -> str:
+    buffer = BytesIO()
+    image.convert("RGB").save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
 def _tool_response_to_openai_tool_message(*, tool_call_id: str, tool_response: ToolResponse) -> dict[str, Any]:
     content: list[dict[str, Any]] = []
 
-    if tool_response.text:
-        content.append({"type": "text", "text": tool_response.text})
+    if tool_response.video:
+        raise NotImplementedError("ToolResponse video content is not supported by the DeepEyes gateway recipe")
+
+    if tool_response.text is not None:
+        content.append({"type": "text", "text": str(tool_response.text)})
     for image in tool_response.image or []:
+        if isinstance(image, Image.Image):
+            image = _image_to_data_uri(image)
         content.append({"type": "image", "image": image})
-    for video in tool_response.video or []:
-        content.append({"type": "video", "video": video})
     if not content:
         content.append({"type": "text", "text": ""})
 
