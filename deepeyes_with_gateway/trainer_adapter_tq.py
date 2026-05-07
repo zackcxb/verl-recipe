@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from functools import partial
+from functools import partial, wraps
 
 import torch
+from tensordict import TensorDict
 
 from verl.agent.framework.framework import OpenAICompatibleAgentFramework
 from verl.agent.gateway.runtime import GatewayServingRuntime
@@ -14,6 +15,101 @@ from verl.utils.tokenizer import hf_processor, hf_tokenizer
 
 from recipe.deepeyes_with_gateway.agent_runner import deepeyes_agent_runner, load_tool_config
 from recipe.deepeyes_with_gateway.trainer_adapter import _build_reward_fn, _config_get, _get_tool_parser_name
+
+try:
+    import transfer_queue as tq
+except ImportError:  # pragma: no cover - main_ppo_sync requires TransferQueue for this adapter.
+    tq = None
+
+
+_TQ_SEQUENCE_FIELDS_REQUIRING_NESTED = {
+    "prompts",
+    "responses",
+    "response_mask",
+    "loss_mask",
+    "input_ids",
+    "attention_mask",
+    "position_ids",
+    "rollout_log_probs",
+    "old_log_probs",
+    "ref_log_prob",
+    "rm_scores",
+    "token_level_scores",
+    "token_level_rewards",
+    "advantages",
+    "returns",
+    "values",
+    "log_probs",
+    "entropy",
+    "teacher_logprobs",
+    "teacher_ids",
+    "routed_experts",
+}
+
+
+def _force_tq_sequence_fields_nested(data):
+    """DeepEyes sync workaround for TransferQueue 0.1.6 dense readback.
+
+    TQ may return dense tensors for same-length sequence fields even when the
+    trainer expects nested tensors. Keep this compatibility shim local to the
+    DeepEyes TQ adapter until TQ owns nested readback semantics upstream.
+    """
+    if not isinstance(data, TensorDict):
+        return data
+
+    for key in _TQ_SEQUENCE_FIELDS_REQUIRING_NESTED:
+        if key not in data.keys():
+            continue
+
+        value = data[key]
+        if not isinstance(value, torch.Tensor) or value.is_nested or value.dim() < 2 or value.size(0) == 0:
+            continue
+
+        rows = list(value.unbind(0))
+        ragged_idx = 2 if key == "position_ids" and rows[0].dim() == 2 else None
+        data[key] = tu.nested_tensor_from_tensor_list(rows, ragged_idx=ragged_idx)
+
+    return data
+
+
+def _wrap_tq_sync_batch_get(func):
+    if getattr(func, "_deepeyes_force_nested_sequence_fields", False):
+        return func
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        return _force_tq_sequence_fields_nested(func(*args, **kwargs))
+
+    wrapper._deepeyes_force_nested_sequence_fields = True
+    return wrapper
+
+
+def _wrap_tq_async_batch_get(func):
+    if getattr(func, "_deepeyes_force_nested_sequence_fields", False):
+        return func
+
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        return _force_tq_sequence_fields_nested(await func(*args, **kwargs))
+
+    wrapper._deepeyes_force_nested_sequence_fields = True
+    return wrapper
+
+
+def _install_tq_nested_readback_workaround() -> None:
+    """Install DeepEyes-local TQ readback workaround before trainer steps run."""
+    if tq is None:
+        return
+
+    for name in ("kv_batch_get", "kv_batch_get_by_meta"):
+        func = getattr(tq, name, None)
+        if func is not None:
+            setattr(tq, name, _wrap_tq_sync_batch_get(func))
+
+    for name in ("async_kv_batch_get", "async_kv_batch_get_by_meta"):
+        func = getattr(tq, name, None)
+        if func is not None:
+            setattr(tq, name, _wrap_tq_async_batch_get(func))
 
 
 def _nested_get(config_obj, path: tuple[str, ...], default=None):
@@ -68,6 +164,7 @@ class AgentFrameworkRolloutAdapterTQ:
     ) -> "AgentFrameworkRolloutAdapterTQ":
         del teacher_client, reward_loop_worker_handles
         assert replay_buffer is not None, "AgentFrameworkRolloutAdapterTQ requires replay_buffer"
+        _install_tq_nested_readback_workaround()
 
         model_path = config.actor_rollout_ref.model.path
         if model_path is None:
