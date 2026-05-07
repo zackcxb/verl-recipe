@@ -1,3 +1,4 @@
+# DEPRECATED: main_ppo.py compatibility path only; active DeepEyes gateway recipe path uses trainer_adapter_tq.py with main_ppo_sync.py.
 """Compatibility facade: lets RayPPOTrainer consume OpenAICompatibleAgentFramework.
 
 RayPPOTrainer expects its rollout manager to expose:
