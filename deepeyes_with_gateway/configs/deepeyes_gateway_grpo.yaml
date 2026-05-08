@@ -64,6 +64,9 @@ actor_rollout_ref:
         gateway_count: 8
         max_turns: 5
         tool_config_path: recipe/deepeyes_with_gateway/configs/image_zoom_in_tool_config.yaml
+        external_agent:
+          command: python
+          module: recipe.deepeyes_with_gateway.external.deepeyes_agent
   ref:
     log_prob_micro_batch_size_per_gpu: 1
     fsdp_config:

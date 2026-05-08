@@ -7,13 +7,10 @@ It does not perform tokenization or vision processing.
 from __future__ import annotations
 
 import copy
-import base64
 import re
-from io import BytesIO
 import logging
 
 import torch
-from PIL import Image
 
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
@@ -50,8 +47,7 @@ class DeepEyesGatewayDataset(RLHFDataset):
                 if segment == "<image>":
                     if image_offset >= len(images):
                         raise ValueError(f"image placeholder count exceeds images at index {image_offset}")
-                    image = _load_image(images[image_offset])
-                    content_list.append({"type": "image", "image": _image_to_data_uri(image)})
+                    content_list.append({"type": "image", "image": images[image_offset]})
                     image_offset += 1
                 elif segment == "<video>":
                     if video_offset >= len(videos):
@@ -137,46 +133,15 @@ class DeepEyesGatewayDataset(RLHFDataset):
         return row_dict
 
 
-def _load_image(image_data):
-    if isinstance(image_data, Image.Image):
-        return image_data.convert("RGB")
-    if isinstance(image_data, dict):
-        if isinstance(image_data.get("image"), Image.Image):
-            return image_data["image"].convert("RGB")
-        if "bytes" in image_data:
-            return Image.open(BytesIO(image_data["bytes"])).convert("RGB")
-    raise TypeError(f"image must be dict or PIL.Image, unsupported image type: {type(image_data)}")
-
-
 def _normalize_content_part(part):
     if not isinstance(part, dict):
         return part
     if part.get("type") in {"image", "image_url"} and "bytes" in part and "image" not in part:
         normalized = dict(part)
         normalized["type"] = "image"
-        normalized["image"] = _image_to_data_uri(_load_image(part))
-        normalized.pop("bytes", None)
-        return normalized
-    if part.get("type") in {"image", "image_url"} and isinstance(part.get("image"), Image.Image):
-        normalized = dict(part)
-        normalized["type"] = "image"
-        normalized["image"] = _image_to_data_uri(part["image"].convert("RGB"))
+        normalized["image"] = {"bytes": normalized.pop("bytes")}
         return normalized
     return part
-
-
-def _image_to_data_uri(image: Image.Image) -> str:
-    buffer = BytesIO()
-    image.save(buffer, format="PNG")
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
-
-
-def _image_from_data_uri(data_uri: str) -> Image.Image | None:
-    if not data_uri.startswith("data:image") or "base64," not in data_uri:
-        return None
-    _, encoded = data_uri.split("base64,", 1)
-    return Image.open(BytesIO(base64.b64decode(encoded))).convert("RGB")
 
 
 def _first_image_from_messages(messages):
@@ -186,11 +151,5 @@ def _first_image_from_messages(messages):
             continue
         for part in content:
             if isinstance(part, dict) and part.get("type") in {"image", "image_url"}:
-                image = part.get("image")
-                if isinstance(image, Image.Image):
-                    return image
-                if isinstance(image, str):
-                    decoded = _image_from_data_uri(image)
-                    if decoded is not None:
-                        return decoded
+                return part.get("image", part)
     return None

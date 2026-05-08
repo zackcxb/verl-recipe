@@ -38,7 +38,7 @@ from verl.utils.ray_utils import auto_await
 from verl.utils.tokenizer import hf_processor, hf_tokenizer
 from verl.workers.rollout.llm_server import LLMServerManager
 
-from recipe.deepeyes_with_gateway.agent_runner import deepeyes_agent_runner, stub_agent_runner
+from recipe.deepeyes_with_gateway.agent_runner import deepeyes_agent_runner
 
 # Non-tensor fields that trainer expects on the output DataProto but the
 # framework doesn't produce (they come from the input batch).
@@ -183,12 +183,10 @@ class AgentFrameworkRolloutAdapter:
             if hasattr(agent_framework_cfg, "get")
             else getattr(agent_framework_cfg, "tool_config_path", None)
         )
-        from recipe.deepeyes_with_gateway.agent_runner import load_tool_config
-        tool_config = load_tool_config(tool_config_path)
         agent_runner = (
-            partial(deepeyes_agent_runner, tool_config=tool_config, max_turns=max_turns)
+            partial(deepeyes_agent_runner, tool_config_path=tool_config_path, max_turns=max_turns)
             if max_turns is not None
-            else partial(deepeyes_agent_runner, tool_config=tool_config)
+            else partial(deepeyes_agent_runner, tool_config_path=tool_config_path)
         )
 
         # Phase 1 uses the existing runtime shape unchanged: it owns gateway
@@ -238,7 +236,7 @@ class AgentFrameworkRolloutAdapter:
         instance._runtime = runtime
         instance._framework = OpenAICompatibleAgentFramework(
             session_runtime=runtime,
-            agent_runner=agent_runner or stub_agent_runner,
+            agent_runner=agent_runner or deepeyes_agent_runner,
             reward_fn=reward_fn or _zero_reward_fn,
             processor=processor,
         )
