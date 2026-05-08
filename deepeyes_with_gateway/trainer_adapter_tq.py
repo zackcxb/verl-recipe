@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from functools import partial
 
 import torch
@@ -13,7 +15,9 @@ from verl.utils.ray_utils import auto_await
 from verl.utils.tokenizer import hf_processor, hf_tokenizer
 
 from recipe.deepeyes_with_gateway.agent_runner import deepeyes_agent_runner
-from recipe.deepeyes_with_gateway.trainer_adapter import _build_reward_fn, _config_get, _get_tool_parser_name
+from recipe.deepeyes_with_gateway._helpers import _build_reward_fn, _config_get, _get_tool_parser_name
+
+logger = logging.getLogger(__name__)
 
 
 def _nested_get(config_obj, path: tuple[str, ...], default=None):
@@ -87,16 +91,10 @@ class AgentFrameworkRolloutAdapterTQ:
             if processor is not None:
                 processor.chat_template = custom_chat_template
 
-        servers_by_id = getattr(llm_client, "_server_id_to_handle", None)
-        load_balancer_handle = getattr(llm_client, "_load_balancer", None)
-        if servers_by_id is None or load_balancer_handle is None:
-            raise ValueError("llm_client must expose _server_id_to_handle and _load_balancer")
-        servers = list(servers_by_id.items())
-
         rollout_cfg = config.actor_rollout_ref.rollout
         agent_framework_cfg = _nested_get(rollout_cfg, ("custom", "agent_framework"), {})
         tool_parser_name = _get_tool_parser_name(rollout_cfg, agent_framework_cfg)
-        gateway_count = _config_get(agent_framework_cfg, "gateway_count", None) or len(servers)
+        gateway_count = _config_get(agent_framework_cfg, "gateway_count", None) or 1
         max_turns = _config_get(agent_framework_cfg, "max_turns", None)
         tool_config_path = _config_get(agent_framework_cfg, "tool_config_path", None)
         agent_runner = (
@@ -106,8 +104,7 @@ class AgentFrameworkRolloutAdapterTQ:
         )
 
         runtime = GatewayServingRuntime(
-            servers=servers,
-            load_balancer_handle=load_balancer_handle,
+            llm_client=llm_client,
             gateway_count=gateway_count,
             gateway_actor_kwargs={
                 "tokenizer": tokenizer,
@@ -137,6 +134,7 @@ class AgentFrameworkRolloutAdapterTQ:
         if self.replay_buffer is None:
             raise RuntimeError("replay_buffer must be initialized before generate_sequences")
 
+        start = time.perf_counter()
         global_steps = _scalar_int(tu.get(prompts, "global_steps"))
         validate = _truthy_first(tu.get(prompts, "validate")) if "validate" in prompts.keys() else False
         partition_id = "val" if validate else "train"
@@ -154,6 +152,18 @@ class AgentFrameworkRolloutAdapterTQ:
             global_steps=global_steps,
             partition_id=partition_id,
             num_sessions=num_sessions,
+        )
+        rollout_elapsed_s = time.perf_counter() - start
+        logger.info(
+            "generate_sequences summary: num_input_prompts=%s num_success_sessions=%s num_failed_sessions=%s "
+            "num_success_outputs=%s num_failed_uids=%s failure_reasons=%s rollout_elapsed_s=%.3f",
+            stats["num_input_prompts"],
+            stats["num_success_sessions"],
+            stats["num_failed_sessions"],
+            stats["num_success_outputs"],
+            stats["num_failed_uids"],
+            stats["failure_reasons"][:3],
+            rollout_elapsed_s,
         )
         if stats["num_success_outputs"] == 0:
             raise RuntimeError(
