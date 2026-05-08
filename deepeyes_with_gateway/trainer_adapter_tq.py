@@ -147,7 +147,7 @@ class AgentFrameworkRolloutAdapterTQ:
         }
         self.replay_buffer.add(partition_id, items)
 
-        stats = await self.framework.generate_to_replay_buffer(
+        stats = await self.framework.generate_sequences(
             prompts,
             global_steps=global_steps,
             partition_id=partition_id,
