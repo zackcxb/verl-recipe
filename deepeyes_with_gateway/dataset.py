@@ -6,11 +6,13 @@ It does not perform tokenization or vision processing.
 
 from __future__ import annotations
 
+import io
 import copy
-import re
 import logging
+import re
 
 import torch
+from PIL import Image
 
 from verl.utils.dataset.rl_dataset import RLHFDataset
 
@@ -20,116 +22,84 @@ logger = logging.getLogger(__name__)
 class DeepEyesGatewayDataset(RLHFDataset):
     """Thin dataset that leaves prompt encoding and vision extraction to the gateway."""
 
-    def _build_messages(self, example: dict, key: str):
-        """Replace media placeholders with OpenAI-style content blocks.
-
-        Tokenization still belongs to the gateway. This method only converts
-        source parquet fields like ``"<image>"`` + ``images`` bytes into the
-        structured message shape that gateway-side vision extraction expects.
-        """
+    def _build_messages(self, example: dict, key: str) -> tuple[list[dict], object | None]:
         messages = copy.deepcopy(example[key])
         images = example.get(self.image_key, None) or []
         videos = example.get(self.video_key, None) or []
-
+        first_image = None
         image_offset = 0
         video_offset = 0
+
         for message in messages:
             content = message.get("content")
             if isinstance(content, list):
-                message["content"] = [_normalize_content_part(part) for part in content]
+                normalized = []
+                for part in content:
+                    normalized_part = _normalize_content_part(part)
+                    if first_image is None and isinstance(normalized_part, dict) and normalized_part.get("type") in {"image", "image_url"}:
+                        first_image = _decode_image_payload(normalized_part.get("image", normalized_part))
+                        normalized_part = dict(normalized_part)
+                        normalized_part["image"] = first_image
+                    normalized.append(normalized_part)
+                message["content"] = normalized
                 continue
             if not isinstance(content, str) or ("<image>" not in content and "<video>" not in content):
                 continue
 
             content_list = []
-            segments = [segment for segment in re.split("(<image>|<video>)", content) if segment]
-            for segment in segments:
+            for segment in (segment for segment in re.split("(<image>|<video>)", content) if segment):
                 if segment == "<image>":
-                    if image_offset >= len(images):
-                        raise ValueError(f"image placeholder count exceeds images at index {image_offset}")
-                    content_list.append({"type": "image", "image": images[image_offset]})
+                    assert image_offset < len(images), f"image placeholder count exceeds images at index {image_offset}"
+                    image = _decode_image_payload(images[image_offset])
+                    if first_image is None:
+                        first_image = image
+                    content_list.append({"type": "image", "image": image})
                     image_offset += 1
                 elif segment == "<video>":
-                    if video_offset >= len(videos):
-                        raise ValueError(f"video placeholder count exceeds videos at index {video_offset}")
+                    assert video_offset < len(videos), f"video placeholder count exceeds videos at index {video_offset}"
                     content_list.append({"type": "video", **videos[video_offset]})
                     video_offset += 1
                 else:
                     content_list.append({"type": "text", "text": segment})
             message["content"] = content_list
 
-        if image_offset != len(images):
-            raise ValueError(f"image placeholder count {image_offset} does not match images count {len(images)}")
-        if video_offset != len(videos):
-            raise ValueError(f"video placeholder count {video_offset} does not match videos count {len(videos)}")
-        return messages
+        assert image_offset == len(images), f"image placeholder count {image_offset} does not match images count {len(images)}"
+        assert video_offset == len(videos), f"video placeholder count {video_offset} does not match videos count {len(videos)}"
+        return messages, first_image
 
     def maybe_filter_out_long_prompts(self, dataframe=None):
-        """Skip base prompt filtering because phase 1 must not tokenize or preprocess vision here."""
         return self.dataframe if dataframe is None else dataframe
 
     def __getitem__(self, item):
         row_dict: dict = self.dataframe[item]
+        raw_messages, first_image = self._build_messages(row_dict, key=self.prompt_key)
 
-        raw_messages = self._build_messages(row_dict, key=self.prompt_key)
-
-        # DeepEyes contract: source data must have [system, user] or [user] shape.
-        # We always produce [system, user] output with our fixed system prompt.
-        if not raw_messages or not isinstance(raw_messages, list):
-            raise ValueError(
-                f"Expected non-empty list of messages at index {item}, "
-                f"got {type(raw_messages).__name__}: {raw_messages!r}"
-            )
-        # Extract user content: expect it at index 1 (after system) or index 0 (user-only).
-        if len(raw_messages) >= 2 and raw_messages[1].get("role") == "user":
-            user_content = raw_messages[1]["content"]
-        elif raw_messages[0].get("role") == "user":
-            user_content = raw_messages[0]["content"]
-        else:
-            raise ValueError(
-                f"Cannot find user message in raw_messages at index {item}. "
-                f"Expected [system, user] or [user] shape, got roles: "
-                f"{[m.get('role') for m in raw_messages]}"
-            )
+        assert isinstance(raw_messages, list) and len(raw_messages) >= 2, raw_messages
+        assert raw_messages[0].get("role") == "system" and raw_messages[1].get("role") == "user", raw_messages
 
         row_dict["raw_prompt"] = [
             {
                 "role": "system",
-                "content": (
-                    "You are a helpful assistant. You can call functions to assist "
-                    "with the user query. Important: You must call only one function "
-                    "at a time."
-                ),
+                "content": "You are a helpful assistant. You can call functions to assist with the user query. Important: You must call only one function at a time.",
             },
-            {
-                "role": "user",
-                "content": user_content,
-            },
+            {"role": "user", "content": raw_messages[1]["content"]},
         ]
-        negative_prompt_key = getattr(self, "negative_prompt_key", None)
-        if negative_prompt_key and negative_prompt_key in row_dict:
-            row_dict["raw_negative_prompt"] = self._build_messages(row_dict, key=negative_prompt_key)
 
         row_dict.pop(self.image_key, None)
         row_dict.pop(self.video_key, None)
-
         row_dict["dummy_tensor"] = torch.tensor([0], dtype=torch.uint8)
 
-        if "extra_info" not in row_dict or row_dict["extra_info"] is None:
-            row_dict["extra_info"] = {}
-        extra_info = row_dict["extra_info"]
+        extra_info = row_dict.get("extra_info") or {}
+        row_dict["extra_info"] = extra_info
         index = extra_info.get("index", 0)
         tools_kwargs = extra_info.get("tools_kwargs", {})
-        first_image = _first_image_from_messages(row_dict["raw_prompt"])
         if not tools_kwargs and first_image is not None:
             tools_kwargs = {"image_zoom_in_tool": {"create_kwargs": {"image": first_image}}}
-        need_tools_kwargs = extra_info.get("need_tools_kwargs", self.need_tools_kwargs)
-        if need_tools_kwargs and not tools_kwargs:
+        if extra_info.get("need_tools_kwargs", self.need_tools_kwargs) and not tools_kwargs:
             logger.warning("tools_kwargs is empty for index %s, data source: %s", index, row_dict.get("data_source"))
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["agent_name"] = "tool_agent"
-
         return row_dict
 
 
@@ -144,12 +114,8 @@ def _normalize_content_part(part):
     return part
 
 
-def _first_image_from_messages(messages):
-    for message in messages:
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for part in content:
-            if isinstance(part, dict) and part.get("type") in {"image", "image_url"}:
-                return part.get("image", part)
-    return None
+def _decode_image_payload(image):
+    if isinstance(image, Image.Image):
+        return image.convert("RGB")
+    assert isinstance(image, dict) and "bytes" in image, f"unexpected image payload: {type(image).__name__}"
+    return Image.open(io.BytesIO(image["bytes"])).convert("RGB")

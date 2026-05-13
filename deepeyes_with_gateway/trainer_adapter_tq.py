@@ -13,6 +13,7 @@ from verl.agent.gateway.runtime import GatewayServingRuntime
 from verl.utils import tensordict_utils as tu
 from verl.utils.ray_utils import auto_await
 from verl.utils.tokenizer import hf_processor, hf_tokenizer
+from verl.tools.utils.tool_registry import initialize_tools_from_config
 
 from recipe.deepeyes_with_gateway.agent_runner import deepeyes_agent_runner
 from recipe.deepeyes_with_gateway._helpers import _build_reward_fn, _config_get, _get_tool_parser_name
@@ -97,10 +98,13 @@ class AgentFrameworkRolloutAdapterTQ:
         gateway_count = _config_get(agent_framework_cfg, "gateway_count", None) or 1
         max_turns = _config_get(agent_framework_cfg, "max_turns", None)
         tool_config_path = _config_get(agent_framework_cfg, "tool_config_path", None)
+        tool_config = initialize_tools_from_config(tool_config_path) if tool_config_path else []
+        if not tool_config:
+            raise ValueError(f"tool config did not initialize any tools: {tool_config_path}")
         agent_runner = (
-            partial(deepeyes_agent_runner, tool_config_path=tool_config_path, max_turns=max_turns)
+            partial(deepeyes_agent_runner, tool_config=tool_config, max_turns=max_turns)
             if max_turns is not None
-            else partial(deepeyes_agent_runner, tool_config_path=tool_config_path)
+            else partial(deepeyes_agent_runner, tool_config=tool_config)
         )
 
         runtime = GatewayServingRuntime(

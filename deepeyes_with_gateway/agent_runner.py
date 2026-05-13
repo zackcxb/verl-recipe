@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
-import sys
 from io import BytesIO
 from typing import Any
 
+import httpx
 from PIL import Image
 
 from verl.agent.framework.types import SessionHandle
+from verl.tools.schemas import ToolResponse
+
+
+IMAGE_ZOOM_IN_TOOL_NAMES = ("image_zoom_in_tool", "image_zoom_in")
+GATEWAY_REQUEST_TIMEOUT_SECONDS = 300.0
 
 
 def _json_ready(value: Any) -> Any:
@@ -32,48 +36,148 @@ def _json_ready(value: Any) -> Any:
     return value
 
 
+def _tool_kwargs_for_name(tools_kwargs: dict | None) -> dict[str, Any]:
+    if not tools_kwargs:
+        return {}
+
+    for tool_name in IMAGE_ZOOM_IN_TOOL_NAMES:
+        maybe_tool_kwargs = tools_kwargs.get(tool_name)
+        if isinstance(maybe_tool_kwargs, dict):
+            return maybe_tool_kwargs
+
+    return tools_kwargs if isinstance(tools_kwargs, dict) else {}
+
+
+def _parse_tool_arguments(arguments: object) -> dict[str, Any]:
+    if isinstance(arguments, dict):
+        return arguments
+    if not isinstance(arguments, str) or not arguments:
+        return {}
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _assistant_message_from_response(payload: dict[str, Any]) -> dict[str, Any]:
+    choices = payload.get("choices")
+    if not choices:
+        raise ValueError("chat completion response did not include choices")
+
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        raise ValueError("chat completion response choice did not include a message")
+    return message
+
+
+def _image_to_data_uri(image: Image.Image) -> str:
+    buffer = BytesIO()
+    image.convert("RGB").save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _tool_response_to_openai_tool_message(*, tool_call_id: str, tool_response: ToolResponse) -> dict[str, Any]:
+    content: list[dict[str, Any]] = []
+
+    if tool_response.video:
+        raise NotImplementedError("ToolResponse video content is not supported by the DeepEyes gateway recipe")
+
+    if tool_response.text is not None:
+        content.append({"type": "text", "text": str(tool_response.text)})
+    for image in tool_response.image or []:
+        if isinstance(image, Image.Image):
+            image = _image_to_data_uri(image)
+        else:
+            image = _json_ready(image)
+        content.append({"type": "image", "image": image})
+    if not content:
+        content.append({"type": "text", "text": ""})
+
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call_id,
+        "content": content,
+    }
+
+
+def _select_tool(tool_config: list[Any] | None):
+    if not tool_config:
+        raise ValueError("tool_config is required for deepeyes_agent_runner")
+
+    for tool in tool_config:
+        if getattr(tool, "name", None) in IMAGE_ZOOM_IN_TOOL_NAMES:
+            return tool
+    return tool_config[0]
+
+
 async def deepeyes_agent_runner(
     *,
     raw_prompt: list[dict],
     session: SessionHandle,
     sample_index: int,
     tools_kwargs: dict | None = None,
-    tool_config_path: str | None = None,
+    tool_config: list[Any] | None = None,
     max_turns: int = 5,
     **kwargs,
 ) -> None:
+    """Run a DeepEyes multi-turn image zoom-in tool loop against the gateway."""
     del sample_index, kwargs
     if session.base_url is None:
         raise ValueError("session.base_url is required for deepeyes_agent_runner")
-    if not tool_config_path:
-        raise ValueError("tool_config_path is required for deepeyes_agent_runner")
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "recipe.deepeyes_with_gateway.external.deepeyes_agent",
-        "--base-url",
-        session.base_url,
-        "--session-id",
-        session.session_id,
-        "--tools-kwargs-json",
-        json.dumps(_json_ready(tools_kwargs or {})),
-        "--tool-config-path",
-        tool_config_path,
-        "--max-turns",
-        str(max_turns),
-    ]
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdin_payload = json.dumps({"raw_prompt": _json_ready(raw_prompt)}).encode("utf-8")
-    stdout, stderr = await proc.communicate(input=stdin_payload)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            "DeepEyes external agent failed with exit code "
-            f"{proc.returncode}: stdout={stdout.decode(errors='replace')!r}, "
-            f"stderr={stderr.decode(errors='replace')!r}"
+    image_tool = _select_tool(tool_config)
+    image_tool_kwargs = _tool_kwargs_for_name(tools_kwargs)
+    create_kwargs = dict(image_tool_kwargs.get("create_kwargs") or {})
+    if "image" not in create_kwargs and "image" in image_tool_kwargs:
+        create_kwargs["image"] = image_tool_kwargs["image"]
+    execute_kwargs = dict(image_tool_kwargs.get("execute_kwargs") or {})
+    release_kwargs = dict(image_tool_kwargs.get("release_kwargs") or {})
+
+    tool_instance_id: str | None = None
+    messages = _json_ready(list(raw_prompt))
+
+    try:
+        tool_instance_id, _ = await image_tool.create(
+            instance_id=f"{session.session_id}-image_zoom_in_tool",
+            create_kwargs=create_kwargs,
         )
+        tool_schema = image_tool.get_openai_tool_schema().model_dump(exclude_none=True)
+
+        async with httpx.AsyncClient(timeout=GATEWAY_REQUEST_TIMEOUT_SECONDS) as client:
+            for turn_index in range(max(0, max_turns)):
+                response = await client.post(
+                    f"{session.base_url}/chat/completions",
+                    json={
+                        "model": "deepeyes",
+                        "messages": messages,
+                        "tools": [tool_schema],
+                    },
+                )
+                response.raise_for_status()
+
+                assistant_message = _assistant_message_from_response(response.json())
+                messages.append(dict(assistant_message))
+
+                tool_calls = assistant_message.get("tool_calls") or []
+                if not tool_calls or turn_index + 1 >= max_turns:
+                    break
+
+                for tool_call in tool_calls:
+                    function = tool_call.get("function") or {}
+                    parameters = _parse_tool_arguments(function.get("arguments"))
+                    tool_response, _, _ = await image_tool.execute(
+                        tool_instance_id,
+                        parameters=parameters,
+                        **execute_kwargs,
+                    )
+                    messages.append(
+                        _tool_response_to_openai_tool_message(
+                            tool_call_id=tool_call.get("id", ""),
+                            tool_response=tool_response,
+                        )
+                    )
+    finally:
+        if tool_instance_id is not None:
+            await image_tool.release(tool_instance_id, **release_kwargs)
