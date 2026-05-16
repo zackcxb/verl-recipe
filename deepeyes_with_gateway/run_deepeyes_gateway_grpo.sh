@@ -54,4 +54,4 @@ python3 -m verl.trainer.main_ppo_sync \
   actor_rollout_ref.rollout.dtype=float16 \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   actor_rollout_ref.rollout.custom.agent_framework.gateway_count=7 \
-  actor_rollout_ref.rollout.custom.agent_framework.max_turns=5
+  actor_rollout_ref.rollout.custom.agent_framework.agent_runner_kwargs.max_turns=5

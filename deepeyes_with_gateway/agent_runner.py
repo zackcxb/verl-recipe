@@ -12,7 +12,7 @@ from verl.agent.framework.types import SessionHandle
 from verl.tools.schemas import ToolResponse
 
 
-IMAGE_ZOOM_IN_TOOL_NAMES = ("image_zoom_in_tool", "image_zoom_in")
+IMAGE_ZOOM_IN_TOOL_NAME = "image_zoom_in_tool"
 GATEWAY_REQUEST_TIMEOUT_SECONDS = 300.0
 
 
@@ -37,15 +37,11 @@ def _json_ready(value: Any) -> Any:
 
 
 def _tool_kwargs_for_name(tools_kwargs: dict | None) -> dict[str, Any]:
-    if not tools_kwargs:
+    if not isinstance(tools_kwargs, dict):
         return {}
 
-    for tool_name in IMAGE_ZOOM_IN_TOOL_NAMES:
-        maybe_tool_kwargs = tools_kwargs.get(tool_name)
-        if isinstance(maybe_tool_kwargs, dict):
-            return maybe_tool_kwargs
-
-    return tools_kwargs if isinstance(tools_kwargs, dict) else {}
+    maybe_tool_kwargs = tools_kwargs.get(IMAGE_ZOOM_IN_TOOL_NAME)
+    return maybe_tool_kwargs if isinstance(maybe_tool_kwargs, dict) else {}
 
 
 def _parse_tool_arguments(arguments: object) -> dict[str, Any]:
@@ -71,13 +67,6 @@ def _assistant_message_from_response(payload: dict[str, Any]) -> dict[str, Any]:
     return message
 
 
-def _image_to_data_uri(image: Image.Image) -> str:
-    buffer = BytesIO()
-    image.convert("RGB").save(buffer, format="PNG")
-    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{encoded}"
-
-
 def _tool_response_to_openai_tool_message(*, tool_call_id: str, tool_response: ToolResponse) -> dict[str, Any]:
     content: list[dict[str, Any]] = []
 
@@ -87,11 +76,7 @@ def _tool_response_to_openai_tool_message(*, tool_call_id: str, tool_response: T
     if tool_response.text is not None:
         content.append({"type": "text", "text": str(tool_response.text)})
     for image in tool_response.image or []:
-        if isinstance(image, Image.Image):
-            image = _image_to_data_uri(image)
-        else:
-            image = _json_ready(image)
-        content.append({"type": "image", "image": image})
+        content.append({"type": "image", "image": _json_ready(image)})
     if not content:
         content.append({"type": "text", "text": ""})
 
@@ -107,9 +92,9 @@ def _select_tool(tool_config: list[Any] | None):
         raise ValueError("tool_config is required for deepeyes_agent_runner")
 
     for tool in tool_config:
-        if getattr(tool, "name", None) in IMAGE_ZOOM_IN_TOOL_NAMES:
+        if getattr(tool, "name", None) == IMAGE_ZOOM_IN_TOOL_NAME:
             return tool
-    return tool_config[0]
+    raise ValueError(f"tool_config must include {IMAGE_ZOOM_IN_TOOL_NAME}")
 
 
 async def deepeyes_agent_runner(

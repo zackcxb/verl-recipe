@@ -61,12 +61,11 @@ actor_rollout_ref:
       agent_loop_manager_class: recipe.deepeyes_with_gateway.trainer_adapter_tq.AgentFrameworkRolloutAdapterTQ
     custom:
       agent_framework:
+        agent_runner_fqn: recipe.deepeyes_with_gateway.agent_runner.deepeyes_agent_runner
         gateway_count: 8
-        max_turns: 5
+        agent_runner_kwargs:
+          max_turns: 5
         tool_config_path: recipe/deepeyes_with_gateway/configs/image_zoom_in_tool_config.yaml
-        external_agent:
-          command: python
-          module: recipe.deepeyes_with_gateway.external.deepeyes_agent
   ref:
     log_prob_micro_batch_size_per_gpu: 1
     fsdp_config:
@@ -84,5 +83,5 @@ trainer:
 
 reward:
   custom_reward_function:
-    path: recipe/deepeyes_with_gateway/reward.py
+    path: recipe/deepeyes/deepeyes.py
     name: compute_score

@@ -16,7 +16,8 @@ It is the multimodal counterpart to the legacy `recipe/deepeyes/` recipe:
 - `agent_runner.py`: runs the in-process multi-turn tool loop through the
   gateway.
 - `trainer_adapter_tq.py`: sync rollout adapter for the gateway path.
-- `reward.py`: reuses the legacy DeepEyes reward function.
+- `configs/deepeyes_gateway_grpo.yaml`: points `reward.custom_reward_function`
+  at `recipe/deepeyes/deepeyes.py::compute_score`.
 - `run_deepeyes_gateway_grpo.sh`: example launch script for real-data training.
 
 ## Prerequisites
@@ -58,7 +59,7 @@ this redesign round:
 - `data.train_batch_size=14`
 - `actor_rollout_ref.rollout.n=4`
 - `actor_rollout_ref.rollout.response_length=1024`
-- `actor_rollout_ref.rollout.custom.agent_framework.max_turns=5`
+- `actor_rollout_ref.rollout.custom.agent_framework.agent_runner_kwargs.max_turns=5`
 - `trainer.total_training_steps=50`
 
 You can override the main inputs through environment variables before launch:
