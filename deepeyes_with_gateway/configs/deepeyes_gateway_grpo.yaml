@@ -58,7 +58,7 @@ actor_rollout_ref:
     free_cache_engine: True
     enable_chunked_prefill: True
     agent:
-      agent_loop_manager_class: recipe.deepeyes_with_gateway.trainer_adapter_tq.AgentFrameworkRolloutAdapterTQ
+      agent_loop_manager_class: verl.agent.framework.entry.AgentFrameworkRolloutAdapter
     custom:
       agent_framework:
         agent_runner_fqn: recipe.deepeyes_with_gateway.agent_runner.deepeyes_agent_runner

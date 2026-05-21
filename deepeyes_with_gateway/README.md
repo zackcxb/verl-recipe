@@ -15,9 +15,10 @@ It is the multimodal counterpart to the legacy `recipe/deepeyes/` recipe:
   messages.
 - `agent_runner.py`: runs the in-process multi-turn tool loop through the
   gateway.
-- `trainer_adapter_tq.py`: sync rollout adapter for the gateway path.
 - `configs/deepeyes_gateway_grpo.yaml`: points `reward.custom_reward_function`
-  at `recipe/deepeyes/deepeyes.py::compute_score`.
+  at `recipe/deepeyes/deepeyes.py::compute_score` and wires
+  `verl.agent.framework.entry.AgentFrameworkRolloutAdapter` as the
+  `agent_loop_manager_class`.
 - `run_deepeyes_gateway_grpo.sh`: example launch script for real-data training.
 
 ## Prerequisites
